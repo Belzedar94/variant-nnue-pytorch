@@ -54,9 +54,9 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <intrin.h>
 #endif
 
-#define FILES 8
-#define RANKS 8
-#define PIECE_TYPES 11
+#define FILES 7
+#define RANKS 7
+#define PIECE_TYPES 9
 #define PIECE_COUNT 32
 #define POCKETS true
 #define KING_SQUARES FILES * RANKS
