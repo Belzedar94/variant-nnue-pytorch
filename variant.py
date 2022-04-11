@@ -9,8 +9,8 @@ POCKETS = 2 * FILES if USE_POCKETS else 0
 
 PIECE_VALUES = {
   1: 126,
-  2: 825,
-  3: 2538,
-  4: 1050,
-  5: 800,
+  2: 781,
+  3: 825,
+  4: 1276,
+  5: 2538,
 }
