@@ -33,7 +33,7 @@ def map_king(sq: int):
     if sq > NUM_SQ / 2:
       # in order to allow unambiguously detecting opposing kings, just return value out of range
       return sq
-    return (sq + 3 * (sq // variant.FILES - 1)) % NUM_KSQ
+    return (sq + 5 * (sq // variant.FILES) - 2) % NUM_KSQ
   return sq % NUM_KSQ
 
 def halfka_psqts():
