@@ -66,7 +66,7 @@ static int map_king(Square sq)
 {
     // Xiangqi/Janggi
     if (Square::KNB == Square(9) && Square::KNB != Square::NB)
-        return (int(sq) + 3 * (int(sq) / int(File::FILE_NB) - 1)) % int(Square::KNB);
+        return (int(sq) + 5 * (int(sq) / int(File::FILE_NB)) - 2)) % int(Square::KNB);
 
     return int(sq) % int(Square::KNB);
 }
