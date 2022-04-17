@@ -55,9 +55,9 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #endif
 
 #define FILES 5
-#define RANKS 6
-#define PIECE_TYPES 10
-#define PIECE_COUNT 20
+#define RANKS 5
+#define PIECE_TYPES 8
+#define PIECE_COUNT 12
 #define POCKETS true
 #define KING_SQUARES FILES * RANKS
 
