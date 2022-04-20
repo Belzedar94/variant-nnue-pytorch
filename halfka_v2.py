@@ -30,10 +30,10 @@ def halfka_hand_idx(is_white_pov: bool, king_sq: int, handCount: int, piece_type
 
 def map_king(sq: int):
   if NUM_KSQ == 9 and NUM_KSQ != NUM_SQ:
-    if sq > NUM_SQ / 2:
+    if sq > 26:
       # in order to allow unambiguously detecting opposing kings, just return value out of range
       return sq
-    return (sq + 3 * (sq // variant.FILES - 1)) % NUM_KSQ
+    return (sq - 2 * (sq // variant.FILES - 1)) % NUM_KSQ
   return sq % NUM_KSQ
 
 def halfka_psqts():
