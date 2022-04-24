@@ -58,7 +58,7 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define RANKS 8
 #define PIECE_TYPES 6
 #define PIECE_COUNT 32
-#define POCKETS true
+#define POCKETS false
 #define KING_SQUARES FILES * RANKS
 
 namespace chess
