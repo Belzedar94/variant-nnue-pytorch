@@ -56,10 +56,10 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #define FILES 5
 #define RANKS 5
-#define PIECE_TYPES 8
-#define PIECE_COUNT 12
+#define PIECE_TYPES 10
+#define PIECE_COUNT 10
 #define POCKETS true
-#define KING_SQUARES FILES * RANKS
+#define KING_SQUARES 25
 
 namespace chess
 {
