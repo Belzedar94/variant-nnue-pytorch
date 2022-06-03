@@ -1,22 +1,20 @@
-RANKS = 8
-FILES = 8
+RANKS = 10
+FILES = 9
 SQUARES = RANKS * FILES
-KING_SQUARES = RANKS * FILES
-PIECE_TYPES = 13
+KING_SQUARES = 1
+PIECE_TYPES = 9
 PIECES = 2 * PIECE_TYPES
 USE_POCKETS = True
 POCKETS = 2 * FILES if USE_POCKETS else 0
 
 PIECE_VALUES = {
-    1 : 126,
-    2 : 781,
-    3 : 825,
-    4 : 1276,
-    5 : 2538,
-    6: 420,
-    7: 1800,
-    8: 2200,
-    9: 400,
-    10: 420,
-    11: 700,
+  1: 420,
+  2: 720,
+  3: 50,
+  4: 700,
+  5: 592,
+  6: 536,
+  7: 592,
+  8: 592,
+  9: 351,
 }
