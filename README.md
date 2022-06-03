@@ -4,6 +4,8 @@ This is the chess variant NNUE training code for [Fairy-Stockfish](https://githu
 
 # Setup
 
+Requires a [CUDA capable GPU](https://developer.nvidia.com/cuda-gpus).
+
 #### Install PyTorch
 
 [PyTorch installation guide](https://pytorch.org/get-started/locally/)
