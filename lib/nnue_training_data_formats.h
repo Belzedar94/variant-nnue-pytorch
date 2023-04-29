@@ -60,7 +60,7 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define PIECE_COUNT 16
 #define POCKETS false
 #define KING_SQUARES 1
-#define DATA_SIZE 512
+#define DATA_SIZE 1024
 
 static_assert(DATA_SIZE % 8 == 0);
 
