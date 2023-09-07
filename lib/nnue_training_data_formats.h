@@ -54,12 +54,12 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <intrin.h>
 #endif
 
-#define FILES 8
+#define FILES 6
 #define RANKS 6
-#define PIECE_TYPES 10
-#define PIECE_COUNT 32
-#define POCKETS false
-#define KING_SQUARES 48
+#define PIECE_TYPES 6
+#define PIECE_COUNT 10
+#define POCKETS true
+#define KING_SQUARES 36
 #define DATA_SIZE 512
 
 static_assert(DATA_SIZE % 8 == 0);
