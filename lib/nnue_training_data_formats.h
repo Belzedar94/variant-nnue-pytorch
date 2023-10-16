@@ -54,11 +54,11 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <intrin.h>
 #endif
 
-#define FILES 6
-#define RANKS 6
-#define PIECE_TYPES 5
-#define PIECE_COUNT 24
-#define POCKETS false
+#define FILES 8
+#define RANKS 8
+#define PIECE_TYPES 6
+#define PIECE_COUNT 32
+#define POCKETS true
 #define KING_SQUARES 1
 #define DATA_SIZE 512
 
