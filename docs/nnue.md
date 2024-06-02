@@ -217,7 +217,7 @@ Since we now have two accumulators, we need to somehow combine them into one vec
 
 So we compute the features for white and black the same, are their weights related? They can be, but it's not required. Engines differ in handling of this. Stockfish uses the same weights for white and black. Seer for example uses separate.
 
-1. Use the same weights for both perspectives. This means the the board state needs to somehow be oriented. Otherwise white king on E1 would produce a different subset of features than a black king on E8, and white king on G4 would produce the same subset of features as a black king on G4. That's bad. The solution is to mirror the position and change the color of the pieces for black's perspective, then the piece placement to feature mapping is logical for both. White king on E1 from white's perspective should be the same as a black king on E8 from black's perspective. Now you may think that flip is the way to go, but while chess has vertical symmetry, Shogi has rotational symmetry. The initial implementation of HalfKP in Stockfish uses rotation to change the perspective, which is arguably incorrect for chess (for example due to castling), but that's a remnant from the past that will hopefully be resolved once a good network using mirror instead of flip will be produced.
+1. Use the same weights for both perspectives. This means that the board state needs to somehow be oriented. Otherwise white king on E1 would produce a different subset of features than a black king on E8, and white king on G4 would produce the same subset of features as a black king on G4. That's bad. The solution is to mirror the position and change the color of the pieces for black's perspective, then the piece placement to feature mapping is logical for both. White king on E1 from white's perspective should be the same as a black king on E8 from black's perspective. Now you may think that flip is the way to go, but while chess has vertical symmetry, Shogi has rotational symmetry. The initial implementation of HalfKP in Stockfish uses rotation to change the perspective, which is arguably incorrect for chess (for example due to castling), but that's a remnant from the past that will hopefully be resolved once a good network using mirror instead of flip will be produced.
 2. Use different weights for different perspectives. Is the white king on E1 actually equal to black king on E8? What about other pieces? Arguably one plays the game differently as black than as white, and it seems it makes sense to use different features for these perspectives. This is how some engines do it, and there's nothing wrong with this. The only downsides are larger size and slightly longer training time, but other than that it might even be better! It also completely removes the discussion about flip or rotate, and lends itself to a simpler, more performant implementation.
 
 #### HalfKP example and network diagram
@@ -956,7 +956,7 @@ void refresh_accumulator(
 }
 ```
 
-similarily for the update:
+similarly for the update:
 
 ```cpp
 void update_accumulator(
@@ -1209,7 +1209,7 @@ int32_t* linear_sparse_input(
     for (; i + 1 < num_nnz_input_indices; i += 2) {
         // We will try to process 2 at a time as much as possible,
         // as we can utilize the available intrinsics better.
-        // Will become more apparant on the visualization.
+        // Will become more apparent on the visualization.
         const int input_id0 = nnz_input_indices[i+0];
         const int input_id1 = nnz_input_indices[i+1];
         const __m256i factor = _mm256_set1_epi32(
@@ -1314,7 +1314,7 @@ void load_weights(
 ) {
     // This goes the same as in the case with sparse inputs, however
     // the weights matrix is no longer continuous and we need to fill
-    // some block indices to know which weights correspond to which ouputs.
+    // some block indices to know which weights correspond to which outputs.
     // This can be done either by discovering the zero blocks during loading,
     // or with a different serialized format with the block indices precomputed.
     // We will omit this here and just assume that layer.nnz_block_ids[input_id][4]
@@ -1612,7 +1612,7 @@ kernel(
 )
 ```
 
-PyTorch tensors can be easly passed to the kernel by using `.data_ptr()`, which results the pointer to the tensor. One must however ensure that the memory is contiguous.
+PyTorch tensors can be easily passed to the kernel by using `.data_ptr()`, which results the pointer to the tensor. One must however ensure that the memory is contiguous.
 
 ### Feature transformer
 
@@ -1692,7 +1692,7 @@ class SparseBatch(ctypes.Structure):
         white_features_indices_t = torch.from_numpy(np.ctypeslib.as_array(self.white_features_indices, shape=(self.size, self.max_active_features)))
         black_features_indices_t = torch.from_numpy(np.ctypeslib.as_array(self.black_features_indices, shape=(self.size, self.max_active_features)))
 
-        # The values are all ones, so we can create these tensors in place easly.
+        # The values are all ones, so we can create these tensors in place easily.
         # No need to go through a copy.
         white_features_values_t = torch.ones(self.num_active_white_features)
         black_features_values_t = torch.ones(self.num_active_black_features)
@@ -1809,7 +1809,7 @@ void feature_transformer_slice_forward(
           float*         shared_output_slice = shared_output                    + slice_offset;
 
     // When we were using the pytorch's sparse matrices we needed to put 2 indices per value,
-    // they were the position index and the feature index. Now we're exploting
+    // they were the position index and the feature index. Now we're exploiting
     // our first assumption - we have a dense matrix of shape [batch_size, max_active_features],
     // and we only store one index per feature, the position index is known.
     const int32_t* const feature_index_row   = feature_indices + block_idx * max_active_features;
