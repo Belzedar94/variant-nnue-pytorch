@@ -3,5 +3,5 @@
 #define PIECE_TYPES 6
 #define PIECE_COUNT 32
 #define POCKETS false
-#define KING_SQUARES 64
+#define KING_SQUARES 1
 #define DATA_SIZE 512
