@@ -1,7 +1,7 @@
-#define FILES 5
-#define RANKS 6
-#define PIECE_TYPES 1
-#define PIECE_COUNT 30
+#define FILES 8
+#define RANKS 8
+#define PIECE_TYPES 6
+#define PIECE_COUNT 16
 #define POCKETS false
 #define KING_SQUARES 1
 #define DATA_SIZE 512
