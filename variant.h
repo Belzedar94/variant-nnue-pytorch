@@ -4,4 +4,4 @@
 #define PIECE_COUNT 64
 #define POCKETS false
 #define KING_SQUARES 1
-#define DATA_SIZE 512
+#define DATA_SIZE 1024
