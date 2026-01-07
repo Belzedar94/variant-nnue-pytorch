@@ -10,8 +10,10 @@ NUM_SQ = variant.SQUARES
 NUM_KSQ = variant.KING_SQUARES
 NUM_PT_REAL = variant.PIECES - (NUM_KSQ != 1)
 NUM_PT_VIRTUAL = variant.PIECES
-NUM_PLANES_REAL = NUM_SQ * NUM_PT_REAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS
-NUM_PLANES_VIRTUAL = NUM_SQ * NUM_PT_VIRTUAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS
+NUM_WALLS = NUM_SQ
+NUM_PLANES_BASE = NUM_SQ * NUM_PT_REAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS
+NUM_PLANES_REAL = NUM_PLANES_BASE + NUM_WALLS
+NUM_PLANES_VIRTUAL = NUM_SQ * NUM_PT_VIRTUAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS + NUM_WALLS
 NUM_INPUTS = NUM_PLANES_REAL * NUM_KSQ
 
 def orient(is_white_pov: bool, sq: int):
@@ -27,6 +29,9 @@ def halfka_idx(is_white_pov: bool, king_sq: int, sq: int, piece_type: int, color
 def halfka_hand_idx(is_white_pov: bool, king_sq: int, handCount: int, piece_type: int, color: bool):
   p_idx = (piece_type - 1) * 2 + (color != is_white_pov)
   return handCount + p_idx * variant.POCKETS + NUM_SQ * NUM_PT_REAL + king_sq * NUM_PLANES_REAL
+
+def halfka_wall_idx(is_white_pov: bool, king_sq: int, sq: int):
+  return orient(is_white_pov, sq) + NUM_PLANES_BASE + king_sq * NUM_PLANES_REAL
 
 def map_king(sq: int):
   # palace squares for Xiangi/Janggi
@@ -59,13 +64,17 @@ def halfka_psqts():
 
 class Features(FeatureBlock):
   def __init__(self):
-    super(Features, self).__init__('HalfKAv2', 0x5f234cb8, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ)]))
+    super(Features, self).__init__('HalfKAv2', 0x9e5a2c13, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ)]))
 
   def get_active_features(self, board: chess.Board):
     def piece_features(turn):
       indices = torch.zeros(NUM_PLANES_REAL * NUM_KSQ)
       for sq, p in board.piece_map().items():
         indices[halfka_idx(turn, orient(turn, board.king(turn)), sq, p)] = 1.0
+      wall_squares = getattr(board, "wall_squares", None)
+      if wall_squares:
+        for sq in wall_squares:
+          indices[halfka_wall_idx(turn, orient(turn, board.king(turn)), sq)] = 1.0
       return indices
     return (piece_features(chess.WHITE), piece_features(chess.BLACK))
 
@@ -74,7 +83,7 @@ class Features(FeatureBlock):
 
 class FactorizedFeatures(FeatureBlock):
   def __init__(self):
-    super(FactorizedFeatures, self).__init__('HalfKAv2^', 0x5f234cb8, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ), ('A', NUM_PLANES_VIRTUAL)]))
+    super(FactorizedFeatures, self).__init__('HalfKAv2^', 0x9e5a2c13, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ), ('A', NUM_PLANES_VIRTUAL)]))
 
   def get_active_features(self, board: chess.Board):
     raise Exception('Not supported yet, you must use the c++ data loader for factorizer support during training')
