@@ -3,5 +3,6 @@
 #define PIECE_TYPES 6
 #define PIECE_COUNT 32
 #define POCKETS false
+#define HAS_WALLS false
 #define KING_SQUARES FILES * RANKS
 #define DATA_SIZE 512

@@ -218,7 +218,8 @@ struct HalfKAv2 {
     static constexpr int NUM_KSQ = static_cast<int>(Square::KNB);
     static constexpr int NUM_SQ = static_cast<int>(Square::NB);
     static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2 - (NUM_KSQ > 1);
-    static constexpr int NUM_WALLS = NUM_SQ;
+    static constexpr bool USE_WALLS = HAS_WALLS;
+    static constexpr int NUM_WALLS = USE_WALLS ? NUM_SQ : 0;
     static constexpr int NUM_PLANES_BASE = NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - (NUM_KSQ > 1));
     static constexpr int NUM_PLANES = NUM_PLANES_BASE + NUM_WALLS;
     static constexpr int INPUTS = NUM_PLANES * NUM_KSQ;
@@ -269,13 +270,16 @@ struct HalfKAv2 {
                     ++j;
                 }
 
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+        if constexpr (USE_WALLS)
         {
-            if (!pos.isWall(sq))
-                continue;
-            values[j] = 1.0f;
-            features[j] = wall_feature_index(color, orient_flip(color, ksq), sq);
-            ++j;
+            for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+            {
+                if (!pos.isWall(sq))
+                    continue;
+                values[j] = 1.0f;
+                features[j] = wall_feature_index(color, orient_flip(color, ksq), sq);
+                ++j;
+            }
         }
 
         return { j, INPUTS };
@@ -285,7 +289,7 @@ struct HalfKAv2 {
 struct HalfKAv2Factorized {
     // Factorized features
     static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2;
-    static constexpr int NUM_WALLS = HalfKAv2::NUM_SQ;
+    static constexpr int NUM_WALLS = HalfKAv2::USE_WALLS ? HalfKAv2::NUM_SQ : 0;
     static constexpr int WALL_OFFSET = HalfKAv2::NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - 2 * (HalfKAv2::NUM_KSQ > 1));
     static constexpr int PIECE_INPUTS = WALL_OFFSET + NUM_WALLS;
     static constexpr int INPUTS = HalfKAv2::INPUTS + PIECE_INPUTS;
@@ -320,13 +324,16 @@ struct HalfKAv2Factorized {
                     ++j;
                 }
 
-        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+        if constexpr (HalfKAv2::USE_WALLS)
         {
-            if (!pos.isWall(sq))
-                continue;
-            values[j] = 1.0f;
-            features[j] = offset + WALL_OFFSET + static_cast<int>(orient_flip(color, sq));
-            ++j;
+            for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+            {
+                if (!pos.isWall(sq))
+                    continue;
+                values[j] = 1.0f;
+                features[j] = offset + WALL_OFFSET + static_cast<int>(orient_flip(color, sq));
+                ++j;
+            }
         }
 
         return { j, INPUTS };
