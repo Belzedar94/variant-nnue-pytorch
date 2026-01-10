@@ -728,16 +728,19 @@ namespace bin
                 }
             }
 
-            // Wall squares
-            for (chess::Rank r = chess::Rank::RANK_MAX; r >= chess::Rank::RANK_1; --r)
+            if constexpr (HAS_WALLS)
             {
-                for (chess::File f = chess::File::FILE_A; f <= chess::File::FILE_MAX; ++f)
+                // Wall squares
+                for (chess::Rank r = chess::Rank::RANK_MAX; r >= chess::Rank::RANK_1; --r)
                 {
-                    auto sq = make_square(f, r);
-                    if (stream.read_one_bit())
+                    for (chess::File f = chess::File::FILE_A; f <= chess::File::FILE_MAX; ++f)
                     {
-                        if (pos.pieceAt(sq) == chess::Piece::None)
-                            pos.setWall(sq);
+                        auto sq = make_square(f, r);
+                        if (stream.read_one_bit())
+                        {
+                            if (pos.pieceAt(sq) == chess::Piece::None)
+                                pos.setWall(sq);
+                        }
                     }
                 }
             }
