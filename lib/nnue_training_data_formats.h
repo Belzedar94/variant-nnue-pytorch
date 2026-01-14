@@ -58,6 +58,10 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 static_assert(DATA_SIZE % 8 == 0);
 
+#ifndef HAS_POTIONS
+#define HAS_POTIONS 0
+#endif
+
 namespace chess
 {
     #if defined(__clang__) || defined(__GNUC__) || defined(__GNUG__)
@@ -120,6 +124,9 @@ namespace chess
         None,
         NB
     };
+
+    constexpr int POTION_TYPE_NB = 2;
+    constexpr int POTION_COOLDOWN_BITS = 16;
 
     constexpr Color color_of(Piece p) {
         return p >= Piece::Black ? Color::Black : Color::White;
@@ -359,7 +366,9 @@ namespace chess
             m_epSquare(Square::NB),
             m_castlingRights(CastlingRights::All),
             m_rule50Counter(0),
-            m_ply(0)
+            m_ply(0),
+            m_potionZones{},
+            m_potionCooldowns{}
         {
         }
 
@@ -369,7 +378,9 @@ namespace chess
             m_epSquare(epSquare),
             m_castlingRights(castlingRights),
             m_rule50Counter(0),
-            m_ply(0)
+            m_ply(0),
+            m_potionZones{},
+            m_potionCooldowns{}
         {
         }
 
@@ -408,6 +419,28 @@ namespace chess
             m_ply = 2 * hm - 1 + (m_sideToMove == Color::Black);
         }
 
+        void setPotionZone(Color c, int potionType,
+                           const std::bitset<static_cast<size_t>(Square::NB)>& zone)
+        {
+            m_potionZones[static_cast<size_t>(c)][potionType] = zone;
+        }
+
+        [[nodiscard]] const std::bitset<static_cast<size_t>(Square::NB)>& potionZone(
+            Color c, int potionType) const
+        {
+            return m_potionZones[static_cast<size_t>(c)][potionType];
+        }
+
+        void setPotionCooldown(Color c, int potionType, std::uint16_t value)
+        {
+            m_potionCooldowns[static_cast<size_t>(c)][potionType] = value;
+        }
+
+        [[nodiscard]] std::uint16_t potionCooldown(Color c, int potionType) const
+        {
+            return m_potionCooldowns[static_cast<size_t>(c)][potionType];
+        }
+
         [[nodiscard]] constexpr Color sideToMove() const
         {
             return m_sideToMove;
@@ -434,6 +467,10 @@ namespace chess
         CastlingRights m_castlingRights;
         std::uint8_t m_rule50Counter;
         std::uint16_t m_ply;
+        std::array<std::array<std::bitset<static_cast<size_t>(Square::NB)>, POTION_TYPE_NB>,
+                   static_cast<size_t>(Color::NB)> m_potionZones;
+        std::array<std::array<std::uint16_t, POTION_TYPE_NB>,
+                   static_cast<size_t>(Color::NB)> m_potionCooldowns;
 
         static_assert(sizeof(Color) + sizeof(Square) + sizeof(CastlingRights) + sizeof(std::uint8_t) == 4);
     };
@@ -459,17 +496,22 @@ namespace bin
 
         using namespace std;
 
+        constexpr int POTION_TYPE_NB = chess::POTION_TYPE_NB;
+        constexpr int POTION_COOLDOWN_BITS = chess::POTION_COOLDOWN_BITS;
+        constexpr int POTION_FREEZE = 0;
+        constexpr int POTION_JUMP = 1;
+
         struct StockfishMove
         {
             [[nodiscard]] chess::Move toMove() const
             {
-                const chess::Square to = static_cast<chess::Square>((m_raw & (0b111111 << 0) >> 0));
-                const chess::Square from = static_cast<chess::Square>((m_raw & (0b111111 << 6)) >> 6);
+                const chess::Square to = static_cast<chess::Square>((m_raw & (0b111111u << 0)) >> 0);
+                const chess::Square from = static_cast<chess::Square>((m_raw & (0b111111u << 6)) >> 6);
 
-                const unsigned promotionIndex = (m_raw & (0b11 << 12)) >> 12;
+                const unsigned promotionIndex = (m_raw & (0b11u << 12)) >> 12;
                 const chess::PieceType promotionType = static_cast<chess::PieceType>(static_cast<int>(chess::PieceType::Knight) + promotionIndex);
 
-                const unsigned moveFlag = (m_raw & (0b11 << 14)) >> 14;
+                const unsigned moveFlag = (m_raw & (0b11u << 14)) >> 14;
                 chess::MoveType type = chess::MoveType::Normal;
                 if (moveFlag == 1) type = chess::MoveType::Promotion;
                 else if (moveFlag == 2) type = chess::MoveType::EnPassant;
@@ -485,9 +527,9 @@ namespace bin
             }
 
         private:
-            std::uint16_t m_raw;
+            std::uint32_t m_raw;
         };
-        static_assert(sizeof(StockfishMove) == sizeof(std::uint16_t));
+        static_assert(sizeof(StockfishMove) == sizeof(std::uint32_t));
 
         struct PackedSfen
         {
@@ -516,12 +558,12 @@ namespace bin
             int8_t game_result;
 
             // When exchanging the file that wrote the teacher aspect with other people
-            //Because this structure size is not fixed, pad it so that it is 40 bytes in any environment.
+            //Because this structure size is not fixed, pad it so that it is DATA_SIZE / 8 + 12 bytes in any environment.
             uint8_t padding;
 
-            // 32 + 2 + 2 + 2 + 1 + 1 = 40bytes
+            // DATA_SIZE / 8 + 4 + 2 + 2 + 1 + 1 (with natural alignment)
         };
-        static_assert(sizeof(PackedSfenValue) == DATA_SIZE / 8 + 8);
+        static_assert(sizeof(PackedSfenValue) == DATA_SIZE / 8 + 12);
         // Class that handles bitstream
 
         // useful when doing aspect encoding
@@ -672,6 +714,41 @@ namespace bin
         };
 
 
+        inline bool on_board(int file, int rank)
+        {
+            return file >= 0 && file < int(chess::File::FILE_NB)
+                   && rank >= 0 && rank < int(chess::Rank::RANK_NB);
+        }
+
+        inline std::bitset<static_cast<size_t>(chess::Square::NB)>
+        potion_zone_from_center(chess::Square center, int potionType)
+        {
+            std::bitset<static_cast<size_t>(chess::Square::NB)> zone;
+            if (center == chess::Square::NB)
+                return zone;
+            if (potionType == POTION_FREEZE)
+            {
+                const int cf = static_cast<int>(chess::file_of(center));
+                const int cr = static_cast<int>(chess::rank_of(center));
+                for (int df = -1; df <= 1; ++df)
+                    for (int dr = -1; dr <= 1; ++dr)
+                    {
+                        const int nf = cf + df;
+                        const int nr = cr + dr;
+                        if (!on_board(nf, nr))
+                            continue;
+                        zone.set(static_cast<size_t>(chess::make_square(
+                            static_cast<chess::File>(nf),
+                            static_cast<chess::Rank>(nr))));
+                    }
+            }
+            else
+            {
+                zone.set(static_cast<size_t>(center));
+            }
+            return zone;
+        }
+
         [[nodiscard]] inline chess::Position pos_from_packed_sfen(const PackedSfen& sfen)
         {
             SfenPacker packer;
@@ -706,9 +783,26 @@ namespace bin
                 }
             }
 
-            for (chess::Color c : { chess::Color::White, chess::Color::Black })
+            for (chess::Color c : { chess::Color::White, chess::Color::Black }) 
                 for (chess::PieceType pt = chess::PieceType::Pawn; pt <= chess::PieceType::MaxPiece; ++pt)
                     pos.setHandCount(make_piece(pt, c), static_cast<int>(stream.read_n_bit(DATA_SIZE > 512 ? 7 : 5)));
+
+            if constexpr (HAS_POTIONS)
+            {
+                for (chess::Color c : { chess::Color::White, chess::Color::Black })
+                    for (int pt = 0; pt < POTION_TYPE_NB; ++pt)
+                    {
+                        const bool has_zone = stream.read_one_bit() != 0;
+                        chess::Square zone_square =
+                            static_cast<chess::Square>(stream.read_n_bit(7));
+                        const std::uint16_t cooldown =
+                            static_cast<std::uint16_t>(stream.read_n_bit(POTION_COOLDOWN_BITS));
+                        if (!has_zone)
+                            zone_square = chess::Square::NB;
+                        pos.setPotionZone(c, pt, potion_zone_from_center(zone_square, pt));
+                        pos.setPotionCooldown(c, pt, cooldown);
+                    }
+            }
 
             // Castling availability.
             chess::CastlingRights cr = chess::CastlingRights::None;

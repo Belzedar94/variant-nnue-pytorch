@@ -10,9 +10,19 @@ NUM_SQ = variant.SQUARES
 NUM_KSQ = variant.KING_SQUARES
 NUM_PT_REAL = variant.PIECES - (NUM_KSQ != 1)
 NUM_PT_VIRTUAL = variant.PIECES
-NUM_PLANES_REAL = NUM_SQ * NUM_PT_REAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS
-NUM_PLANES_VIRTUAL = NUM_SQ * NUM_PT_VIRTUAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS
+HAS_POTIONS = getattr(variant, "HAS_POTIONS", False)
+POTION_TYPE_NB = 2
+POTION_COOLDOWN_BITS = 16
+POTION_ZONE_PLANES = POTION_TYPE_NB * 2 if HAS_POTIONS else 0
+POTION_ZONE_FEATURES = POTION_ZONE_PLANES * NUM_SQ
+POTION_COOLDOWN_FEATURES = POTION_TYPE_NB * 2 * POTION_COOLDOWN_BITS if HAS_POTIONS else 0
+NUM_PLANES_BASE = NUM_SQ * NUM_PT_REAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS
+POTION_ZONE_OFFSET = NUM_PLANES_BASE
+POTION_COOLDOWN_OFFSET = POTION_ZONE_OFFSET + POTION_ZONE_FEATURES
+NUM_PLANES_REAL = NUM_PLANES_BASE + POTION_ZONE_FEATURES + POTION_COOLDOWN_FEATURES
+NUM_PLANES_VIRTUAL = NUM_SQ * NUM_PT_VIRTUAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS + POTION_ZONE_FEATURES + POTION_COOLDOWN_FEATURES
 NUM_INPUTS = NUM_PLANES_REAL * NUM_KSQ
+FEATURE_HASH = 0x7c2d4f9e if HAS_POTIONS else 0x5f234cb8
 
 def orient(is_white_pov: bool, sq: int):
   return sq % variant.FILES + (variant.RANKS - 1 - (sq // variant.FILES)) * variant.FILES if not is_white_pov else sq
@@ -27,6 +37,14 @@ def halfka_idx(is_white_pov: bool, king_sq: int, sq: int, piece_type: int, color
 def halfka_hand_idx(is_white_pov: bool, king_sq: int, handCount: int, piece_type: int, color: bool):
   p_idx = (piece_type - 1) * 2 + (color != is_white_pov)
   return handCount + p_idx * variant.POCKETS + NUM_SQ * NUM_PT_REAL + king_sq * NUM_PLANES_REAL
+
+def halfka_potion_zone_idx(is_white_pov: bool, king_sq: int, sq: int, potion_type: int, owner_color: bool):
+  potion_idx = potion_type + POTION_TYPE_NB * (0 if owner_color == chess.WHITE else 1)
+  return orient(is_white_pov, sq) + POTION_ZONE_OFFSET + potion_idx * NUM_SQ + king_sq * NUM_PLANES_REAL
+
+def halfka_potion_cooldown_idx(is_white_pov: bool, king_sq: int, bit: int, potion_type: int, owner_color: bool):
+  potion_idx = potion_type + POTION_TYPE_NB * (0 if owner_color == chess.WHITE else 1)
+  return bit + POTION_COOLDOWN_OFFSET + potion_idx * POTION_COOLDOWN_BITS + king_sq * NUM_PLANES_REAL
 
 def map_king(sq: int):
   # palace squares for Xiangi/Janggi
@@ -59,13 +77,26 @@ def halfka_psqts():
 
 class Features(FeatureBlock):
   def __init__(self):
-    super(Features, self).__init__('HalfKAv2', 0x5f234cb8, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ)]))
+    super(Features, self).__init__('HalfKAv2', FEATURE_HASH, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ)]))
 
   def get_active_features(self, board: chess.Board):
     def piece_features(turn):
       indices = torch.zeros(NUM_PLANES_REAL * NUM_KSQ)
+      ksq = orient(turn, board.king(turn))
       for sq, p in board.piece_map().items():
-        indices[halfka_idx(turn, orient(turn, board.king(turn)), sq, p)] = 1.0
+        indices[halfka_idx(turn, ksq, sq, p)] = 1.0
+      if HAS_POTIONS:
+        potion_zones = getattr(board, "potion_zones", None)
+        if isinstance(potion_zones, dict):
+          for (owner_color, potion_type), squares in potion_zones.items():
+            for sq in squares:
+              indices[halfka_potion_zone_idx(turn, ksq, sq, potion_type, owner_color)] = 1.0
+        potion_cooldowns = getattr(board, "potion_cooldowns", None)
+        if isinstance(potion_cooldowns, dict):
+          for (owner_color, potion_type), cooldown in potion_cooldowns.items():
+            for bit in range(POTION_COOLDOWN_BITS):
+              if cooldown & (1 << bit):
+                indices[halfka_potion_cooldown_idx(turn, ksq, bit, potion_type, owner_color)] = 1.0
       return indices
     return (piece_features(chess.WHITE), piece_features(chess.BLACK))
 
@@ -74,7 +105,7 @@ class Features(FeatureBlock):
 
 class FactorizedFeatures(FeatureBlock):
   def __init__(self):
-    super(FactorizedFeatures, self).__init__('HalfKAv2^', 0x5f234cb8, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ), ('A', NUM_PLANES_VIRTUAL)]))
+    super(FactorizedFeatures, self).__init__('HalfKAv2^', FEATURE_HASH, OrderedDict([('HalfKAv2', NUM_PLANES_REAL * NUM_KSQ), ('A', NUM_PLANES_VIRTUAL)]))
 
   def get_active_features(self, board: chess.Board):
     raise Exception('Not supported yet, you must use the c++ data loader for factorizer support during training')
