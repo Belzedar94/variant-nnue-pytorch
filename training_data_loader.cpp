@@ -252,7 +252,8 @@ struct HalfKAv2 {
     static int potion_zone_feature_index(Color perspective, Square ksq, Color potionColor,
                                          int potionType, Square sq)
     {
-        const int potionIndex = potionType + POTION_TYPE_NB * static_cast<int>(potionColor);
+        const int relativeColor = static_cast<int>(potionColor != perspective);
+        const int potionIndex = potionType + POTION_TYPE_NB * relativeColor;
         return static_cast<int>(orient_flip(perspective, sq))
                + POTION_ZONE_OFFSET + potionIndex * NUM_SQ
                + map_king(ksq) * NUM_PLANES;
@@ -261,7 +262,8 @@ struct HalfKAv2 {
     static int potion_cooldown_feature_index(Color perspective, Square ksq, Color potionColor,
                                              int potionType, int bit)
     {
-        const int potionIndex = potionType + POTION_TYPE_NB * static_cast<int>(potionColor);
+        const int relativeColor = static_cast<int>(potionColor != perspective);
+        const int potionIndex = potionType + POTION_TYPE_NB * relativeColor;
         return bit + POTION_COOLDOWN_OFFSET
                + potionIndex * POTION_COOLDOWN_BITS
                + map_king(ksq) * NUM_PLANES;
@@ -375,7 +377,7 @@ struct HalfKAv2Factorized {
                         if (!zone.test(static_cast<size_t>(sq)))
                             continue;
                         values[j] = 1.0f;
-                        const int potionIndex = pt + POTION_TYPE_NB * static_cast<int>(c);
+                        const int potionIndex = pt + POTION_TYPE_NB * static_cast<int>(c != color);
                         features[j] = offset + POTION_ZONE_OFFSET
                                       + potionIndex * HalfKAv2::NUM_SQ
                                       + static_cast<int>(orient_flip(color, sq));
@@ -387,7 +389,7 @@ struct HalfKAv2Factorized {
                         if (!(cooldown & (1u << bit)))
                             continue;
                         values[j] = 1.0f;
-                        const int potionIndex = pt + POTION_TYPE_NB * static_cast<int>(c);
+                        const int potionIndex = pt + POTION_TYPE_NB * static_cast<int>(c != color);
                         features[j] = offset + POTION_COOLDOWN_OFFSET
                                       + potionIndex * POTION_COOLDOWN_BITS
                                       + bit;

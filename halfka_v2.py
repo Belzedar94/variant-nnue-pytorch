@@ -22,7 +22,7 @@ POTION_COOLDOWN_OFFSET = POTION_ZONE_OFFSET + POTION_ZONE_FEATURES
 NUM_PLANES_REAL = NUM_PLANES_BASE + POTION_ZONE_FEATURES + POTION_COOLDOWN_FEATURES
 NUM_PLANES_VIRTUAL = NUM_SQ * NUM_PT_VIRTUAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * variant.POCKETS + POTION_ZONE_FEATURES + POTION_COOLDOWN_FEATURES
 NUM_INPUTS = NUM_PLANES_REAL * NUM_KSQ
-FEATURE_HASH = 0x7c2d4f9e if HAS_POTIONS else 0x5f234cb8
+FEATURE_HASH = 0x6a8f3c12 if HAS_POTIONS else 0x5f234cb8
 
 def orient(is_white_pov: bool, sq: int):
   return sq % variant.FILES + (variant.RANKS - 1 - (sq // variant.FILES)) * variant.FILES if not is_white_pov else sq
@@ -39,11 +39,13 @@ def halfka_hand_idx(is_white_pov: bool, king_sq: int, handCount: int, piece_type
   return handCount + p_idx * variant.POCKETS + NUM_SQ * NUM_PT_REAL + king_sq * NUM_PLANES_REAL
 
 def halfka_potion_zone_idx(is_white_pov: bool, king_sq: int, sq: int, potion_type: int, owner_color: bool):
-  potion_idx = potion_type + POTION_TYPE_NB * (0 if owner_color == chess.WHITE else 1)
+  pov_color = chess.WHITE if is_white_pov else chess.BLACK
+  potion_idx = potion_type + POTION_TYPE_NB * (0 if owner_color == pov_color else 1)
   return orient(is_white_pov, sq) + POTION_ZONE_OFFSET + potion_idx * NUM_SQ + king_sq * NUM_PLANES_REAL
 
 def halfka_potion_cooldown_idx(is_white_pov: bool, king_sq: int, bit: int, potion_type: int, owner_color: bool):
-  potion_idx = potion_type + POTION_TYPE_NB * (0 if owner_color == chess.WHITE else 1)
+  pov_color = chess.WHITE if is_white_pov else chess.BLACK
+  potion_idx = potion_type + POTION_TYPE_NB * (0 if owner_color == pov_color else 1)
   return bit + POTION_COOLDOWN_OFFSET + potion_idx * POTION_COOLDOWN_BITS + king_sq * NUM_PLANES_REAL
 
 def map_king(sq: int):
