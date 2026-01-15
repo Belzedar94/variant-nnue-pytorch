@@ -62,6 +62,11 @@ static Square orient_flip(Color color, Square sq)
     }
 }
 
+static Color other_color(Color color)
+{
+    return color == Color::White ? Color::Black : Color::White;
+}
+
 static int map_king(Square sq)
 {
     // palace squares for Xiangi/Janggi
@@ -90,7 +95,6 @@ struct HalfKP {
     {
         auto& pos = e.pos;
         auto ksq = pos.kingSquare(color);
-
         // We order the features so that the resulting sparse
         // tensor is coalesced.
         int j = 0;
@@ -218,10 +222,14 @@ struct HalfKAv2 {
     static constexpr int NUM_KSQ = static_cast<int>(Square::KNB);
     static constexpr int NUM_SQ = static_cast<int>(Square::NB);
     static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2 - (NUM_KSQ > 1);
-    static constexpr int NUM_PLANES = NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - (NUM_KSQ > 1));
+    static constexpr int NUM_POINTS_SCORE_PLANES = HAS_POINTS ? 2 * POINTS_SCORE_BITS : 0;
+    static constexpr int NUM_CHECK_PLANES = HAS_CHECKS ? 2 * CHECKS_BITS : 0;
+    static constexpr int NUM_POINTS_PLANES = NUM_POINTS_SCORE_PLANES + NUM_CHECK_PLANES;
+    static constexpr int NUM_PLANES_BASE = NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - (NUM_KSQ > 1));
+    static constexpr int NUM_PLANES = NUM_PLANES_BASE + NUM_POINTS_PLANES;
     static constexpr int INPUTS = NUM_PLANES * NUM_KSQ;
 
-    static constexpr int MAX_ACTIVE_FEATURES = MAX_PIECES;
+    static constexpr int MAX_ACTIVE_FEATURES = MAX_PIECES + NUM_POINTS_PLANES;
 
     static int feature_index(Color color, Square ksq, Square sq, Piece p)
     {
@@ -237,10 +245,17 @@ struct HalfKAv2 {
         return handCount + p_idx * MAX_HAND_PIECES + NUM_SQ * NUM_PT + map_king(ksq) * NUM_PLANES;
     }
 
+    static int points_feature_index(Color color, Square ksq, int plane)
+    {
+        (void)color;
+        return plane + NUM_PLANES_BASE + map_king(ksq) * NUM_PLANES;
+    }
+
     static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
     {
         auto& pos = e.pos;
         auto ksq = pos.kingSquare(color);
+        auto oriented_ksq = orient_flip(color, ksq);
 
         int j = 0;
         for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
@@ -249,7 +264,7 @@ struct HalfKAv2 {
             if (p == Piece::None)
                 continue;
             values[j] = 1.0f;
-            features[j] = feature_index(color, orient_flip(color, ksq), sq, p);
+            features[j] = feature_index(color, oriented_ksq, sq, p);
             ++j;
         }
 
@@ -258,9 +273,63 @@ struct HalfKAv2 {
                 for (int i = 0; i < pos.getHandCount(make_piece(pt, c)); i++)
                 {
                     values[j] = 1.0f;
-                    features[j] = feature_index(color, orient_flip(color, ksq), i, make_piece(pt, c));
+                    features[j] = feature_index(color, oriented_ksq, i, make_piece(pt, c));
                     ++j;
                 }
+
+        if constexpr (HAS_POINTS || HAS_CHECKS)
+        {
+            int planeOffset = 0;
+            if constexpr (HAS_POINTS)
+            {
+                auto clamp_points = [](int value) {
+                    return std::min<int>(std::max(0, value), (1 << POINTS_SCORE_BITS) - 1);
+                };
+                int usScore = clamp_points(static_cast<int>(pos.pointsScore(color)));
+                int themScore = clamp_points(static_cast<int>(pos.pointsScore(other_color(color))));
+                for (int bit = 0; bit < POINTS_SCORE_BITS; ++bit)
+                {
+                    int mask = 1 << bit;
+                    if (usScore & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = points_feature_index(color, oriented_ksq, planeOffset + bit);
+                        ++j;
+                    }
+                    if (themScore & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = points_feature_index(color, oriented_ksq, planeOffset + POINTS_SCORE_BITS + bit);
+                        ++j;
+                    }
+                }
+                planeOffset += NUM_POINTS_SCORE_PLANES;
+            }
+            if constexpr (HAS_CHECKS)
+            {
+                auto clamp_checks = [](int value) {
+                    return std::min<int>(std::max(0, value), (1 << CHECKS_BITS) - 1);
+                };
+                int usChecks = clamp_checks(static_cast<int>(pos.checksRemaining(color)));
+                int themChecks = clamp_checks(static_cast<int>(pos.checksRemaining(other_color(color))));
+                for (int bit = 0; bit < CHECKS_BITS; ++bit)
+                {
+                    int mask = 1 << bit;
+                    if (usChecks & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = points_feature_index(color, oriented_ksq, planeOffset + bit);
+                        ++j;
+                    }
+                    if (themChecks & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = points_feature_index(color, oriented_ksq, planeOffset + CHECKS_BITS + bit);
+                        ++j;
+                    }
+                }
+            }
+        }
 
         return { j, INPUTS };
     }
@@ -269,10 +338,14 @@ struct HalfKAv2 {
 struct HalfKAv2Factorized {
     // Factorized features
     static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2;
-    static constexpr int PIECE_INPUTS = HalfKAv2::NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - 2 * (HalfKAv2::NUM_KSQ > 1));
+    static constexpr int NUM_POINTS_SCORE_PLANES = HalfKAv2::NUM_POINTS_SCORE_PLANES;
+    static constexpr int NUM_CHECK_PLANES = HalfKAv2::NUM_CHECK_PLANES;
+    static constexpr int NUM_POINTS_PLANES = NUM_POINTS_SCORE_PLANES + NUM_CHECK_PLANES;
+    static constexpr int POINTS_OFFSET = HalfKAv2::NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - 2 * (HalfKAv2::NUM_KSQ > 1));
+    static constexpr int PIECE_INPUTS = POINTS_OFFSET + NUM_POINTS_PLANES;
     static constexpr int INPUTS = HalfKAv2::INPUTS + PIECE_INPUTS;
 
-    static constexpr int MAX_PIECE_FEATURES = MAX_PIECES;
+    static constexpr int MAX_PIECE_FEATURES = MAX_PIECES + NUM_POINTS_PLANES;
     static constexpr int MAX_ACTIVE_FEATURES = HalfKAv2::MAX_ACTIVE_FEATURES + MAX_PIECE_FEATURES;
 
     static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
@@ -301,6 +374,60 @@ struct HalfKAv2Factorized {
                     features[j] = offset + i + p_idx * MAX_HAND_PIECES + HalfKAv2::NUM_SQ * NUM_PT;
                     ++j;
                 }
+
+        if constexpr (HAS_POINTS || HAS_CHECKS)
+        {
+            int planeOffset = 0;
+            if constexpr (HAS_POINTS)
+            {
+                auto clamp_points = [](int value) {
+                    return std::min<int>(std::max(0, value), (1 << POINTS_SCORE_BITS) - 1);
+                };
+                int usScore = clamp_points(static_cast<int>(pos.pointsScore(color)));
+                int themScore = clamp_points(static_cast<int>(pos.pointsScore(other_color(color))));
+                for (int bit = 0; bit < POINTS_SCORE_BITS; ++bit)
+                {
+                    int mask = 1 << bit;
+                    if (usScore & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = offset + POINTS_OFFSET + planeOffset + bit;
+                        ++j;
+                    }
+                    if (themScore & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = offset + POINTS_OFFSET + planeOffset + POINTS_SCORE_BITS + bit;
+                        ++j;
+                    }
+                }
+                planeOffset += NUM_POINTS_SCORE_PLANES;
+            }
+            if constexpr (HAS_CHECKS)
+            {
+                auto clamp_checks = [](int value) {
+                    return std::min<int>(std::max(0, value), (1 << CHECKS_BITS) - 1);
+                };
+                int usChecks = clamp_checks(static_cast<int>(pos.checksRemaining(color)));
+                int themChecks = clamp_checks(static_cast<int>(pos.checksRemaining(other_color(color))));
+                for (int bit = 0; bit < CHECKS_BITS; ++bit)
+                {
+                    int mask = 1 << bit;
+                    if (usChecks & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = offset + POINTS_OFFSET + planeOffset + bit;
+                        ++j;
+                    }
+                    if (themChecks & mask)
+                    {
+                        values[j] = 1.0f;
+                        features[j] = offset + POINTS_OFFSET + planeOffset + CHECKS_BITS + bit;
+                        ++j;
+                    }
+                }
+            }
+        }
 
         return { j, INPUTS };
     }

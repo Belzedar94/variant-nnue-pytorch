@@ -398,6 +398,16 @@ namespace chess
             m_rule50Counter = v;
         }
 
+        constexpr void setPointsScore(Color c, std::uint16_t score)
+        {
+            m_pointsScore[static_cast<uint8_t>(c)] = score;
+        }
+
+        constexpr void setChecksRemaining(Color c, std::uint8_t count)
+        {
+            m_checksRemaining[static_cast<uint8_t>(c)] = count;
+        }
+
         constexpr void setPly(std::uint16_t ply)
         {
             m_ply = ply;
@@ -423,6 +433,16 @@ namespace chess
             return m_ply;
         }
 
+        [[nodiscard]] inline std::uint16_t pointsScore(Color c) const
+        {
+            return m_pointsScore[static_cast<uint8_t>(c)];
+        }
+
+        [[nodiscard]] inline std::uint8_t checksRemaining(Color c) const
+        {
+            return m_checksRemaining[static_cast<uint8_t>(c)];
+        }
+
         [[nodiscard]] inline std::uint16_t fullMove() const
         {
             return (m_ply + 1) / 2;
@@ -434,6 +454,8 @@ namespace chess
         CastlingRights m_castlingRights;
         std::uint8_t m_rule50Counter;
         std::uint16_t m_ply;
+        std::uint16_t m_pointsScore[(unsigned int)(Color::NB)]{};
+        std::uint8_t m_checksRemaining[(unsigned int)(Color::NB)]{};
 
         static_assert(sizeof(Color) + sizeof(Square) + sizeof(CastlingRights) + sizeof(std::uint8_t) == 4);
     };
@@ -705,6 +727,14 @@ namespace bin
                     assert(stream.get_cursor() <= DATA_SIZE);
                 }
             }
+
+            if (HAS_POINTS)
+                for (chess::Color c : { chess::Color::White, chess::Color::Black })
+                    pos.setPointsScore(c, static_cast<std::uint16_t>(stream.read_n_bit(POINTS_SCORE_BITS)));
+
+            if (HAS_CHECKS)
+                for (chess::Color c : { chess::Color::White, chess::Color::Black })
+                    pos.setChecksRemaining(c, static_cast<std::uint8_t>(stream.read_n_bit(CHECKS_BITS)));
 
             for (chess::Color c : { chess::Color::White, chess::Color::Black })
                 for (chess::PieceType pt = chess::PieceType::Pawn; pt <= chess::PieceType::MaxPiece; ++pt)
