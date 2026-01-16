@@ -489,7 +489,8 @@ namespace bin
 
         constexpr int MOVE_TYPE_BITS = 4;
         constexpr int PIECE_TYPE_BITS = 6;
-        using RawMove = std::conditional_t<(MOVE_SQUARE_BITS_VALUE > 6), std::uint32_t, std::uint16_t>;
+        using RawMove = std::conditional_t<(MOVE_SQUARE_BITS_VALUE > 7), std::uint64_t,
+                         std::conditional_t<(MOVE_SQUARE_BITS_VALUE > 6), std::uint32_t, std::uint16_t>>;
 
         struct StockfishMove
         {
@@ -519,12 +520,12 @@ namespace bin
                 }
                 else
                 {
-                    const std::uint32_t raw = static_cast<std::uint32_t>(m_raw);
-                    const std::uint32_t squareMask = (1u << MOVE_SQUARE_BITS_VALUE) - 1u;
+                    const std::uint64_t raw = static_cast<std::uint64_t>(m_raw);
+                    const std::uint64_t squareMask = (1ULL << MOVE_SQUARE_BITS_VALUE) - 1ULL;
                     const chess::Square to = static_cast<chess::Square>(raw & squareMask);
                     const chess::Square from = static_cast<chess::Square>((raw >> MOVE_SQUARE_BITS_VALUE) & squareMask);
 
-                    const std::uint32_t moveFlag = (raw >> (2 * MOVE_SQUARE_BITS_VALUE)) & 0xF;
+                    const std::uint64_t moveFlag = (raw >> (2 * MOVE_SQUARE_BITS_VALUE)) & 0xFULL;
                     chess::MoveType type = chess::MoveType::Normal;
                     if (moveFlag == 1) type = chess::MoveType::EnPassant;
                     else if (moveFlag == 2) type = chess::MoveType::Castle;
@@ -532,8 +533,8 @@ namespace bin
 
                     if (type == chess::MoveType::Promotion)
                     {
-                        const std::uint32_t ptRaw = (raw >> (2 * MOVE_SQUARE_BITS_VALUE + MOVE_TYPE_BITS))
-                                                  & ((1u << PIECE_TYPE_BITS) - 1u);
+                        const std::uint64_t ptRaw = (raw >> (2 * MOVE_SQUARE_BITS_VALUE + MOVE_TYPE_BITS))
+                                                  & ((1ULL << PIECE_TYPE_BITS) - 1ULL);
                         int ptIndex = static_cast<int>(ptRaw);
                         if (ptIndex > 0)
                             ptIndex -= 1;
