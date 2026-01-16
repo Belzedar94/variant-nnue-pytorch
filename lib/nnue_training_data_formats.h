@@ -47,6 +47,7 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <thread>
 #include <mutex>
 #include <random>
+#include <type_traits>
 
 #include "rng.h"
 
@@ -57,6 +58,33 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "../variant.h"
 
 static_assert(DATA_SIZE % 8 == 0);
+static_assert(DATA_SIZE % 32 == 0);
+
+constexpr int bits_needed(unsigned int value) {
+    int bits = 0;
+    while ((1u << bits) <= value && bits < 31)
+        ++bits;
+    return bits ? bits : 1;
+}
+
+constexpr int SQUARES = FILES * RANKS;
+constexpr int BOARD_SQUARE_BITS = bits_needed(SQUARES - 1);
+constexpr int PIECE_CODES = 2 * PIECE_TYPES + 1;
+constexpr int PIECE_BITS = bits_needed(PIECE_CODES - 1);
+constexpr bool USE_WIDE_SFEN = (SQUARES > 128 || PIECE_TYPES > 16);
+constexpr int POCKET_BITS = USE_WIDE_SFEN ? bits_needed(PIECE_COUNT) : (DATA_SIZE > 512 ? 7 : 5);
+constexpr int KING_BITS = USE_WIDE_SFEN ? BOARD_SQUARE_BITS : 7;
+constexpr int EP_BITS = USE_WIDE_SFEN ? BOARD_SQUARE_BITS : 7;
+
+#ifndef NNUE_KING
+#define NNUE_KING (KING_SQUARES > 1)
+#endif
+
+#ifdef MOVE_SQUARE_BITS
+constexpr int MOVE_SQUARE_BITS_VALUE = MOVE_SQUARE_BITS;
+#else
+constexpr int MOVE_SQUARE_BITS_VALUE = BOARD_SQUARE_BITS;
+#endif
 
 namespace chess
 {
@@ -161,32 +189,32 @@ namespace chess
         FILE_NB
     };
 
-    enum struct Square : std::uint8_t
+    enum struct Square : std::uint16_t
     {
         MIN = 0,
-        NB = std::uint8_t(Rank::RANK_NB) * std::uint8_t(File::FILE_NB),
+        NB = SQUARES,
         MAX = NB - 1,
         KNB = KING_SQUARES,
     };
 
     inline Square make_square(File f, Rank r) {
-        return Square(std::uint8_t(File::FILE_NB) * std::uint8_t(r) + std::uint8_t(f));
+        return Square(std::uint16_t(File::FILE_NB) * std::uint16_t(r) + std::uint16_t(f));
     }
 
     inline Rank file_of(Square s) {
-        return Rank(std::uint8_t(s) % std::uint8_t(File::FILE_NB));
+        return Rank(std::uint16_t(s) % std::uint16_t(File::FILE_NB));
     }
 
     inline Rank rank_of(Square s) {
-        return Rank(std::uint8_t(s) / std::uint8_t(File::FILE_NB));
+        return Rank(std::uint16_t(s) / std::uint16_t(File::FILE_NB));
     }
 
     inline Square flip_horizontally(Square s) {
-        return Square(std::uint8_t(s) + std::uint8_t(File::FILE_MAX) - 2 * std::uint8_t(file_of(s)));
+        return Square(std::uint16_t(s) + std::uint16_t(File::FILE_MAX) - 2 * std::uint16_t(file_of(s)));
     }
 
     inline Square flip_vertically(Square s) {
-        return Square(std::int8_t(s) + (std::int8_t(Rank::RANK_MAX) - 2 * std::int8_t(rank_of(s))) * std::int8_t(File::FILE_NB));
+        return Square(std::int16_t(s) + (std::int16_t(Rank::RANK_MAX) - 2 * std::int16_t(rank_of(s))) * std::int16_t(File::FILE_NB));
     }
 
     #define ENABLE_INCR_OPERATORS_ON(T)                                \
@@ -239,7 +267,7 @@ namespace chess
         }
     };
 
-    static_assert(sizeof(Move) == 4);
+    static_assert(sizeof(Move) <= 8);
 
     enum struct CastlingRights : std::uint8_t
     {
@@ -293,7 +321,7 @@ namespace chess
             m_pieceCount{},
             m_kings{}
         {
-            std::fill_n(m_pieces, static_cast<uint8_t>(Square::NB), Piece::None);
+            std::fill_n(m_pieces, static_cast<std::size_t>(Square::NB), Piece::None);
         }
 
         constexpr void place(Piece piece, Square sq)
@@ -302,12 +330,12 @@ namespace chess
             {
                 m_kings[static_cast<uint8_t>(color_of(piece))] = sq;
                 assert(sq != Square::NB || KING_SQUARES == 1);
-                if (sq == Square::NB)
-                    // No king
-                    return;
-            }
-            auto oldPiece = m_pieces[static_cast<uint8_t>(sq)];
-            m_pieces[static_cast<uint8_t>(sq)] = piece;
+            if (sq == Square::NB)
+                // No king
+                return;
+        }
+        auto oldPiece = m_pieces[static_cast<std::size_t>(sq)];
+        m_pieces[static_cast<std::size_t>(sq)] = piece;
             if (oldPiece != Piece::None)
                 --m_pieceCount;
             if (piece != Piece::None)
@@ -326,7 +354,7 @@ namespace chess
 
         [[nodiscard]] constexpr Piece pieceAt(Square sq) const
         {
-            return m_pieces[static_cast<uint8_t>(sq)];
+            return m_pieces[static_cast<std::size_t>(sq)];
         }
 
         [[nodiscard]] inline Square kingSquare(Color c) const
@@ -342,7 +370,7 @@ namespace chess
         const Piece* piecesRaw() const;
 
     private:
-        Piece m_pieces[(unsigned int)(Square::NB)];
+        Piece m_pieces[static_cast<std::size_t>(Square::NB)];
         uint8_t m_pocketCount[(unsigned int)(Piece::NB)];
         uint8_t m_pieceCount;
         Square m_kings[(unsigned int)(Color::NB)];
@@ -435,7 +463,7 @@ namespace chess
         std::uint8_t m_rule50Counter;
         std::uint16_t m_ply;
 
-        static_assert(sizeof(Color) + sizeof(Square) + sizeof(CastlingRights) + sizeof(std::uint8_t) == 4);
+        static_assert(sizeof(Color) + sizeof(Square) + sizeof(CastlingRights) + sizeof(std::uint8_t) <= 6);
     };
 
 }
@@ -459,35 +487,74 @@ namespace bin
 
         using namespace std;
 
+        constexpr int MOVE_TYPE_BITS = 4;
+        constexpr int PIECE_TYPE_BITS = 6;
+        using RawMove = std::conditional_t<(MOVE_SQUARE_BITS_VALUE > 6), std::uint32_t, std::uint16_t>;
+
         struct StockfishMove
         {
             [[nodiscard]] chess::Move toMove() const
             {
-                const chess::Square to = static_cast<chess::Square>((m_raw & (0b111111 << 0) >> 0));
-                const chess::Square from = static_cast<chess::Square>((m_raw & (0b111111 << 6)) >> 6);
-
-                const unsigned promotionIndex = (m_raw & (0b11 << 12)) >> 12;
-                const chess::PieceType promotionType = static_cast<chess::PieceType>(static_cast<int>(chess::PieceType::Knight) + promotionIndex);
-
-                const unsigned moveFlag = (m_raw & (0b11 << 14)) >> 14;
-                chess::MoveType type = chess::MoveType::Normal;
-                if (moveFlag == 1) type = chess::MoveType::Promotion;
-                else if (moveFlag == 2) type = chess::MoveType::EnPassant;
-                else if (moveFlag == 3) type = chess::MoveType::Castle;
-
-                if (type == chess::MoveType::Promotion)
+                if constexpr (MOVE_SQUARE_BITS_VALUE <= 6)
                 {
-                    const chess::Color stm = rank_of(to) >= chess::Rank::RANK_5 ? chess::Color::White : chess::Color::Black;
-                    return chess::Move{from, to, type, make_piece(promotionType, stm)};
-                }
+                    const chess::Square to = static_cast<chess::Square>((m_raw & (0b111111 << 0) >> 0));
+                    const chess::Square from = static_cast<chess::Square>((m_raw & (0b111111 << 6)) >> 6);
 
-                return chess::Move{from, to, type};
+                    const unsigned promotionIndex = (m_raw & (0b11 << 12)) >> 12;
+                    const chess::PieceType promotionType = static_cast<chess::PieceType>(static_cast<int>(chess::PieceType::Knight) + promotionIndex);
+
+                    const unsigned moveFlag = (m_raw & (0b11 << 14)) >> 14;
+                    chess::MoveType type = chess::MoveType::Normal;
+                    if (moveFlag == 1) type = chess::MoveType::Promotion;
+                    else if (moveFlag == 2) type = chess::MoveType::EnPassant;
+                    else if (moveFlag == 3) type = chess::MoveType::Castle;
+
+                    if (type == chess::MoveType::Promotion)
+                    {
+                        const chess::Color stm = rank_of(to) >= chess::Rank::RANK_5 ? chess::Color::White : chess::Color::Black;
+                        return chess::Move{from, to, type, make_piece(promotionType, stm)};
+                    }
+
+                    return chess::Move{from, to, type};
+                }
+                else
+                {
+                    const std::uint32_t raw = static_cast<std::uint32_t>(m_raw);
+                    const std::uint32_t squareMask = (1u << MOVE_SQUARE_BITS_VALUE) - 1u;
+                    const chess::Square to = static_cast<chess::Square>(raw & squareMask);
+                    const chess::Square from = static_cast<chess::Square>((raw >> MOVE_SQUARE_BITS_VALUE) & squareMask);
+
+                    const std::uint32_t moveFlag = (raw >> (2 * MOVE_SQUARE_BITS_VALUE)) & 0xF;
+                    chess::MoveType type = chess::MoveType::Normal;
+                    if (moveFlag == 1) type = chess::MoveType::EnPassant;
+                    else if (moveFlag == 2) type = chess::MoveType::Castle;
+                    else if (moveFlag == 3 || moveFlag == 5) type = chess::MoveType::Promotion;
+
+                    if (type == chess::MoveType::Promotion)
+                    {
+                        const std::uint32_t ptRaw = (raw >> (2 * MOVE_SQUARE_BITS_VALUE + MOVE_TYPE_BITS))
+                                                  & ((1u << PIECE_TYPE_BITS) - 1u);
+                        int ptIndex = static_cast<int>(ptRaw);
+                        if (ptIndex > 0)
+                            ptIndex -= 1;
+                        if (ptIndex < 0)
+                            ptIndex = 0;
+                        if (ptIndex > static_cast<int>(chess::PieceType::MaxPiece))
+                            ptIndex = static_cast<int>(chess::PieceType::MaxPiece);
+                        const auto promotionType = static_cast<chess::PieceType>(ptIndex);
+                        const int rank_mid = static_cast<int>(chess::Rank::RANK_NB) / 2;
+                        const chess::Color stm = static_cast<int>(rank_of(to)) >= rank_mid ? chess::Color::White : chess::Color::Black;
+                        return chess::Move{from, to, type, make_piece(promotionType, stm)};
+                    }
+
+                    return chess::Move{from, to, type};
+                }
             }
 
         private:
-            std::uint16_t m_raw;
+            RawMove m_raw;
         };
-        static_assert(sizeof(StockfishMove) == sizeof(std::uint16_t));
+        static_assert(sizeof(StockfishMove) == sizeof(RawMove));
 
         struct PackedSfen
         {
@@ -499,12 +566,12 @@ namespace bin
             // phase
             PackedSfen sfen;
 
-            // Evaluation value returned from Learner::search()
-            int16_t score;
-
             // PV first move
             // Used when finding the match rate with the teacher
             StockfishMove move;
+
+            // Evaluation value returned from Learner::search()
+            int16_t score;
 
             // Trouble of the phase from the initial phase.
             uint16_t gamePly;
@@ -518,10 +585,11 @@ namespace bin
             // When exchanging the file that wrote the teacher aspect with other people
             //Because this structure size is not fixed, pad it so that it is 40 bytes in any environment.
             uint8_t padding;
-
-            // 32 + 2 + 2 + 2 + 1 + 1 = 40bytes
         };
-        static_assert(sizeof(PackedSfenValue) == DATA_SIZE / 8 + 8);
+        constexpr std::size_t PACKED_SFEN_VALUE_BYTES = DATA_SIZE / 8 + sizeof(RawMove) + 6;
+        constexpr std::size_t PACKED_SFEN_VALUE_SIZE =
+            (PACKED_SFEN_VALUE_BYTES + alignof(RawMove) - 1) / alignof(RawMove) * alignof(RawMove);
+        static_assert(sizeof(PackedSfenValue) == PACKED_SFEN_VALUE_SIZE);
         // Class that handles bitstream
 
         // useful when doing aspect encoding
@@ -646,6 +714,17 @@ namespace bin
             // Read one board piece from stream
             [[nodiscard]] chess::Piece read_board_piece_from_stream()
             {
+                if (USE_WIDE_SFEN)
+                {
+                    int code = stream.read_n_bit(PIECE_BITS);
+                    if (code == 0)
+                        return chess::Piece::None;
+
+                    chess::Color c = ((code - 1) & 1) ? chess::Color::Black : chess::Color::White;
+                    int idx = (code - 1) >> 1;
+                    return make_piece(static_cast<chess::PieceType>(idx), c);
+                }
+
                 int pr = 0;
                 int code = 0, bits = 0;
                 while (true)
@@ -684,8 +763,13 @@ namespace bin
             pos.setSideToMove((chess::Color)stream.read_one_bit());
 
             // First the position of the ball
-            pos.place(make_piece(chess::PieceType::King, chess::Color::White), static_cast<chess::Square>(stream.read_n_bit(7)));
-            pos.place(make_piece(chess::PieceType::King, chess::Color::Black), static_cast<chess::Square>(stream.read_n_bit(7)));
+            const chess::Square white_king = static_cast<chess::Square>(stream.read_n_bit(KING_BITS));
+            const chess::Square black_king = static_cast<chess::Square>(stream.read_n_bit(KING_BITS));
+            if (NNUE_KING)
+            {
+                pos.place(make_piece(chess::PieceType::King, chess::Color::White), white_king);
+                pos.place(make_piece(chess::PieceType::King, chess::Color::Black), black_king);
+            }
 
             // Piece placement
             for (chess::Rank r = chess::Rank::RANK_MAX; r >= chess::Rank::RANK_1; --r)
@@ -708,7 +792,7 @@ namespace bin
 
             for (chess::Color c : { chess::Color::White, chess::Color::Black })
                 for (chess::PieceType pt = chess::PieceType::Pawn; pt <= chess::PieceType::MaxPiece; ++pt)
-                    pos.setHandCount(make_piece(pt, c), static_cast<int>(stream.read_n_bit(DATA_SIZE > 512 ? 7 : 5)));
+                    pos.setHandCount(make_piece(pt, c), static_cast<int>(stream.read_n_bit(POCKET_BITS)));
 
             // Castling availability.
             chess::CastlingRights cr = chess::CastlingRights::None;
@@ -728,7 +812,7 @@ namespace bin
 
             // En passant square. Ignore if no pawn capture is possible
             if (stream.read_one_bit()) {
-                chess::Square ep_square = static_cast<chess::Square>(stream.read_n_bit(7));
+                chess::Square ep_square = static_cast<chess::Square>(stream.read_n_bit(EP_BITS));
                 pos.setEpSquare(ep_square);
             }
 
