@@ -1,7 +1,10 @@
 chess
 matplotlib
+numpy<2
 --extra-index-url https://download.pytorch.org/whl/cu128
-torch
+torch>=2.1,<2.8
 pytorch-lightning==1.9.5
+torchmetrics==0.11.4
 tensorboard
 cupy-cuda12x
+pytest
