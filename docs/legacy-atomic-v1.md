@@ -62,6 +62,13 @@ python serialize.py model.pt candidate.nnue
 ```
 
 Training and validation must be distinct filesystem objects unless
-`--allow-train-as-validation` is explicitly supplied for a smoke test. Use one
-Lightning device per process; multi-device data sharding is outside this legacy
-compatibility path.
+`--allow-train-as-validation` is explicitly supplied for a smoke test. This
+legacy path rejects a Lightning world size other than one before constructing
+the stateful native streams. Multi-device or multi-node training remains
+unsupported until rank-aware deterministic data sharding is implemented.
+
+The loader bounds-checks the packed bit stream and all board indices before
+constructing a position. A structurally valid 72-byte record with an invalid
+king square, Huffman code, teacher move, or result fails the batch fetch; worker
+exceptions are returned to Python as `RuntimeError` rather than being mistaken
+for end-of-file.

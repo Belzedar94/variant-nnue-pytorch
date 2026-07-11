@@ -3,11 +3,13 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <functional>
+#include <exception>
 #include <iterator>
 #include <future>
 #include <fstream>
@@ -443,8 +445,29 @@ struct Stream : AnyStream
 
     virtual StorageT* next() = 0;
 
+    void clear_last_error() noexcept
+    {
+        m_last_error[0] = '\0';
+    }
+
+    void set_last_error(const char* error) noexcept
+    {
+        std::snprintf(
+            m_last_error.data(),
+            m_last_error.size(),
+            "%s",
+            error == nullptr ? "unknown native loader error" : error
+        );
+    }
+
+    [[nodiscard]] const char* last_error() const noexcept
+    {
+        return m_last_error.data();
+    }
+
 protected:
     std::unique_ptr<training_data::BasicSfenInputStream> m_stream;
+    std::array<char, 1024> m_last_error{};
 };
 
 template <typename StorageT>
@@ -496,53 +519,69 @@ struct FeaturedBatchStream : Stream<StorageT>
 
         auto worker = [this]()
         {
-            std::vector<TrainingDataEntry> entries;
-            entries.reserve(m_batch_size);
-
-            while(!m_stop_flag.load())
+            try
             {
-                entries.clear();
-                std::uint64_t sequence = 0;
+                std::vector<TrainingDataEntry> entries;
+                entries.reserve(m_batch_size);
 
+                while(!m_stop_flag.load())
                 {
-                    std::unique_lock lock(m_stream_mutex);
-                    BaseType::m_stream->fill(entries, m_batch_size);
-                    if (entries.empty())
+                    entries.clear();
+                    std::uint64_t sequence = 0;
+
                     {
-                        break;
+                        std::unique_lock lock(m_stream_mutex);
+                        BaseType::m_stream->fill(entries, m_batch_size);
+                        if (entries.empty())
+                        {
+                            break;
+                        }
+                        sequence = m_next_input_sequence++;
                     }
-                    sequence = m_next_input_sequence++;
+
+                    auto batch = std::make_unique<StorageT>(FeatureSet{}, entries);
+
+                    {
+                        std::unique_lock lock(m_batch_mutex);
+                        m_batches_not_full.wait(lock, [this, sequence]() {
+                            // Always allow the next batch the consumer needs. Without
+                            // this exception, later batches can fill the bounded map
+                            // while the slowest worker is still constructing the
+                            // earliest one, deadlocking the whole stream.
+                            return m_batches.size() < static_cast<std::size_t>(m_concurrency + 1)
+                                || sequence == m_next_output_sequence
+                                || m_stop_flag.load();
+                        });
+
+                        if (m_stop_flag.load())
+                        {
+                            break;
+                        }
+
+                        const auto [unused, inserted] = m_batches.emplace(sequence, batch.get());
+                        if (!inserted)
+                            throw std::logic_error("duplicate native-loader batch sequence");
+                        batch.release();
+
+                        lock.unlock();
+                        m_batches_any.notify_all();
+                    }
                 }
-
-                auto batch = new StorageT(FeatureSet{}, entries);
-
+            }
+            catch (...)
+            {
                 {
                     std::unique_lock lock(m_batch_mutex);
-                    m_batches_not_full.wait(lock, [this, sequence]() {
-                        // Always allow the next batch the consumer needs. Without
-                        // this exception, later batches can fill the bounded map
-                        // while the slowest worker is still constructing the
-                        // earliest one, deadlocking the whole stream.
-                        return m_batches.size() < static_cast<std::size_t>(m_concurrency + 1)
-                            || sequence == m_next_output_sequence
-                            || m_stop_flag.load();
-                    });
-
-                    if (m_stop_flag.load())
-                    {
-                        delete batch;
-                        break;
-                    }
-
-                    m_batches.emplace(sequence, batch);
-
-                    lock.unlock();
-                    m_batches_any.notify_all();
+                    if (!m_worker_exception)
+                        m_worker_exception = std::current_exception();
+                    m_stop_flag.store(true);
                 }
-
+                m_batches_not_full.notify_all();
+                m_batches_any.notify_all();
             }
+
             m_num_workers.fetch_sub(1);
-            m_batches_any.notify_one();
+            m_batches_any.notify_all();
         };
 
         const int num_feature_threads = std::max(
@@ -567,8 +606,12 @@ struct FeaturedBatchStream : Stream<StorageT>
         std::unique_lock lock(m_batch_mutex);
         m_batches_any.wait(lock, [this]() {
             return m_batches.find(m_next_output_sequence) != m_batches.end()
-                || m_num_workers.load() == 0;
+                || m_num_workers.load() == 0
+                || m_worker_exception;
         });
+
+        if (m_worker_exception)
+            std::rethrow_exception(m_worker_exception);
 
         const auto it = m_batches.find(m_next_output_sequence);
         if (it != m_batches.end())
@@ -589,6 +632,7 @@ struct FeaturedBatchStream : Stream<StorageT>
     {
         m_stop_flag.store(true);
         m_batches_not_full.notify_all();
+        m_batches_any.notify_all();
 
         for (auto& worker : m_workers)
         {
@@ -614,6 +658,7 @@ private:
     std::mutex m_stream_mutex;
     std::condition_variable m_batches_not_full;
     std::condition_variable m_batches_any;
+    std::exception_ptr m_worker_exception;
     std::atomic_bool m_stop_flag;
     std::atomic_int m_num_workers{0};
 
@@ -828,7 +873,31 @@ extern "C" {
 
     EXPORT SparseBatch* CDECL fetch_next_sparse_batch(Stream<SparseBatch>* stream)
     {
-        return stream == nullptr ? nullptr : stream->next();
+        if (stream == nullptr)
+            return nullptr;
+
+        stream->clear_last_error();
+        try
+        {
+            return stream->next();
+        }
+        catch (const std::exception& error)
+        {
+            stream->set_last_error(error.what());
+            fprintf(stderr, "Failed to fetch sparse batch: %s\n", error.what());
+            return nullptr;
+        }
+        catch (...)
+        {
+            stream->set_last_error("unknown native loader error");
+            fprintf(stderr, "Failed to fetch sparse batch: unknown error\n");
+            return nullptr;
+        }
+    }
+
+    EXPORT const char* CDECL get_sparse_batch_stream_error(Stream<SparseBatch>* stream)
+    {
+        return stream == nullptr ? "null native loader stream" : stream->last_error();
     }
 
     EXPORT void CDECL destroy_sparse_batch(SparseBatch* e)

@@ -54,6 +54,16 @@ def default_batch_size(device):
   return 16384 if torch.device(device).type == 'cuda' else 128
 
 
+def require_single_device_trainer(trainer):
+  """Fail closed until the stateful native stream has rank-aware sharding."""
+  world_size = int(trainer.world_size)
+  if world_size != 1:
+    raise ValueError(
+      'Legacy Atomic V1 training supports exactly one Lightning process/device; '
+      'multi-device and multi-node strategies would duplicate the stateful native stream.'
+    )
+
+
 def validate_data_paths(train_filename, val_filename, allow_train_as_validation=False):
   if not os.path.isfile(train_filename):
     raise FileNotFoundError('{} is not a training-data file'.format(train_filename))
@@ -153,6 +163,7 @@ def main():
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
   checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True, every_n_epochs=1, save_top_k=-1)
   trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
+  require_single_device_trainer(trainer)
 
   main_device = torch.device(trainer.strategy.root_device)
 

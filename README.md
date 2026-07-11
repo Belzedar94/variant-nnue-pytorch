@@ -23,8 +23,12 @@ If your GPU is CUDA 12.8 capable, use `requirements-CUDA128.txt` instead.
 Both files pin the NumPy and TorchMetrics compatibility bounds required by
 PyTorch Lightning 1.9.5.
 
-For CPU-only use, install a CPU PyTorch wheel and omit CuPy. The portable
-PyTorch feature-transformer path is selected automatically.
+For CPU-only use on Windows or Linux, install the pinned CPU manifest. It omits
+CuPy and selects the portable PyTorch feature-transformer path automatically:
+
+```
+pip install -r requirements-CPU.txt
+```
 
 #### Build the fast DataLoader
 This requires a C++17 compiler and cmake.
@@ -48,9 +52,12 @@ ctest --test-dir build -C Release --output-on-failure
 python -m pytest
 ```
 
-CI runs the native and CPU-only Python suites on both Linux and Windows. When
-the suite is run on a CUDA machine with matching CuPy support, it additionally
-executes the optimized-kernel forward/backward test.
+CI installs that exact CPU manifest and runs the native and Python suites on
+both Linux and Windows. CUDA tests are optional in those public jobs and a skip
+is not release evidence. Set `ATOMIC_REQUIRE_CUDA_TESTS=1` on a CUDA/CuPy host
+to make missing CUDA support fail the suite. Maintainers can trigger the same
+required gate manually on a trusted runner labelled `self-hosted, cuda`; it is
+never scheduled for untrusted pull requests.
 
 # Train a network
 
@@ -98,6 +105,9 @@ immediately back to `.nnue` is byte-exact. See
 ```
 python train.py train_data.bin val_data.bin --accelerator gpu --devices 1 ...
 ```
+The Legacy Atomic V1 loader rejects a Lightning world size above one before it
+opens either dataset. Deterministic rank-aware sharding must be implemented
+before `--devices 2` or multi-node training can be supported safely.
 ## Feature set selection
 By default the trainer uses a factorized HalfKAv2 feature set (named "HalfKAv2^")
 If you wish to change the feature set used then you can use the `--features=NAME` option. For the list of available features see `--help`

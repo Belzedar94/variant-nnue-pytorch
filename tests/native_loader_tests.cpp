@@ -19,6 +19,95 @@ static Square sq(int file, int rank)
     return static_cast<Square>(rank * static_cast<int>(File::FILE_NB) + file);
 }
 
+static void set_bits(bin::nodchip::PackedSfen& sfen, int offset, std::uint32_t value, int width)
+{
+    for (int bit = 0; bit < width; ++bit)
+    {
+        const auto mask = static_cast<std::uint8_t>(1U << ((offset + bit) & 7));
+        auto& byte = sfen.data[(offset + bit) / 8];
+        if ((value >> bit) & 1U)
+            byte |= mask;
+        else
+            byte &= static_cast<std::uint8_t>(~mask);
+    }
+}
+
+static void set_raw_move(bin::nodchip::PackedSfenValue& record, std::uint16_t raw)
+{
+    static_assert(sizeof(record.move) == sizeof(raw));
+    std::memcpy(&record.move, &raw, sizeof(raw));
+}
+
+static bin::nodchip::PackedSfenValue valid_legacy_record()
+{
+    bin::nodchip::PackedSfenValue record{};
+    int cursor = 0;
+    auto write = [&](std::uint32_t value, int width) {
+        set_bits(record.sfen, cursor, value, width);
+        cursor += width;
+    };
+
+    write(0, 1);   // White to move.
+    write(4, 7);   // White king e1.
+    write(60, 7);  // Black king e8.
+
+    for (int rank = static_cast<int>(Rank::RANK_MAX);
+         rank >= static_cast<int>(Rank::RANK_1);
+         --rank)
+    {
+        for (int file = static_cast<int>(File::FILE_A);
+             file <= static_cast<int>(File::FILE_MAX);
+             ++file)
+        {
+            const auto square = sq(file, rank);
+            if (square == sq(4, 0) || square == sq(4, 7))
+                continue;
+            if (square == sq(0, 1))
+            {
+                write(0b00001, 5);  // Pawn.
+                write(0, 1);        // White.
+            }
+            else
+                write(0, 1);        // Empty.
+        }
+    }
+
+    for (Color color : {Color::White, Color::Black})
+        for (PieceType pt = PieceType::Pawn; pt <= PieceType::MaxPiece; ++pt)
+        {
+            (void) color;
+            write(0, DATA_SIZE > 512 ? 7 : 5);
+        }
+
+    for (int i = 0; i < 4; ++i)
+        write(0, 1);  // No castling rights.
+    write(0, 1);      // No en-passant square.
+    write(0, 6);      // Rule 50 low bits.
+    write(1, 8);      // Fullmove low bits.
+    write(0, 8);      // Fullmove high bits.
+    write(0, 1);      // Rule 50 high bit.
+    assert(cursor <= DATA_SIZE);
+
+    set_raw_move(record, static_cast<std::uint16_t>(16 | (8 << 6)));  // a2a3.
+    record.game_result = 0;
+    return record;
+}
+
+static void expect_invalid_record(
+    const bin::nodchip::PackedSfenValue& record,
+    const char* expected_message)
+{
+    try
+    {
+        (void) bin::packedSfenValueToTrainingDataEntry(record);
+        assert(false && "corrupt Legacy72 record was accepted");
+    }
+    catch (const std::invalid_argument& error)
+    {
+        assert(std::string(error.what()).find(expected_message) != std::string::npos);
+    }
+}
+
 static TrainingDataEntry quiet_entry()
 {
     TrainingDataEntry entry{};
@@ -150,11 +239,73 @@ static void test_c_api_validation()
     assert(fetch_next_sparse_batch(nullptr) == nullptr);
 }
 
+static void test_corrupt_full_size_records_fail_closed()
+{
+    const auto valid = valid_legacy_record();
+    const auto decoded = bin::packedSfenValueToTrainingDataEntry(valid);
+    assert(decoded.move.from == sq(0, 1));
+    assert(decoded.move.to == sq(0, 2));
+
+    std::vector<std::pair<std::string, bin::nodchip::PackedSfenValue>> corrupt;
+
+    auto duplicate_king = valid;
+    set_bits(duplicate_king.sfen, 8, 4, 7);
+    corrupt.emplace_back("same square", duplicate_king);
+
+    auto king_out_of_range = valid;
+    set_bits(king_out_of_range.sfen, 1, 65, 7);
+    corrupt.emplace_back("outside the board", king_out_of_range);
+
+    auto invalid_huffman = valid;
+    set_bits(invalid_huffman.sfen, 15, 0b01011, 5);
+    corrupt.emplace_back("Huffman", invalid_huffman);
+
+    auto invalid_move = valid;
+    set_raw_move(invalid_move, static_cast<std::uint16_t>(8 | (8 << 6)));
+    corrupt.emplace_back("move squares", invalid_move);
+
+    auto invalid_result = valid;
+    invalid_result.game_result = 2;
+    corrupt.emplace_back("result", invalid_result);
+
+    const auto unique_suffix = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()
+    );
+
+    for (std::size_t index = 0; index < corrupt.size(); ++index)
+    {
+        const auto& [message, record] = corrupt[index];
+        expect_invalid_record(record, message.c_str());
+
+        const auto path = std::filesystem::temp_directory_path()
+            / ("corrupt-legacy72-" + unique_suffix + "-" + std::to_string(index) + ".bin");
+        {
+            std::ofstream output(path, std::ios::binary);
+            assert(output);
+            output.write(reinterpret_cast<const char*>(&record), sizeof(record));
+            assert(output);
+        }
+
+        const auto path_string = path.string();
+        auto stream = create_sparse_batch_stream_with_seed(
+            "HalfKAv2", 2, path_string.c_str(), 1, false, false, 0, 0
+        );
+        assert(stream != nullptr);
+        assert(fetch_next_sparse_batch(stream) == nullptr);
+        const char* native_error = get_sparse_batch_stream_error(stream);
+        assert(native_error != nullptr && native_error[0] != '\0');
+        assert(std::string(native_error).find(message) != std::string::npos);
+        destroy_sparse_batch_stream(stream);
+        assert(std::filesystem::remove(path));
+    }
+}
+
 int main()
 {
     static_assert(sizeof(bin::nodchip::PackedSfenValue) == 72, "legacy ABI must stay 72 bytes");
     test_smart_filter();
     test_seeded_random_skipping();
     test_c_api_validation();
+    test_corrupt_full_size_records_fail_closed();
     return 0;
 }

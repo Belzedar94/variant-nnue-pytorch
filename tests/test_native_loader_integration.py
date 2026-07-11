@@ -142,3 +142,27 @@ def test_native_batch_is_destroyed_when_tensor_conversion_fails(monkeypatch):
     finally:
         provider.__del__()
     assert destroyed == [pointer]
+
+
+def test_full_size_corrupt_record_propagates_native_error(atomic_legacy_32, tmp_path):
+    record = bytearray(atomic_legacy_32.read_bytes()[:72])
+    record[70] = 2  # Legacy game_result must be -1, 0, or 1.
+    corrupt = tmp_path / 'corrupt-result.bin'
+    corrupt.write_bytes(record)
+
+    provider = nnue_dataset.SparseBatchProvider(
+        'HalfKAv2',
+        str(corrupt),
+        1,
+        cyclic=False,
+        num_workers=2,
+        filtered=False,
+        random_fen_skipping=0,
+        device='cpu',
+        seed=0,
+    )
+    try:
+        with pytest.raises(RuntimeError, match='result'):
+            next(provider)
+    finally:
+        provider.__del__()

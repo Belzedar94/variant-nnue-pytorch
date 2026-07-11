@@ -8,6 +8,7 @@ import nnue_dataset
 def test_seeded_native_loader_binding_is_available():
     assert hasattr(nnue_dataset.dll, "create_sparse_batch_stream")
     assert hasattr(nnue_dataset.dll, "create_sparse_batch_stream_with_seed")
+    assert hasattr(nnue_dataset.dll, "get_sparse_batch_stream_error")
     assert len(nnue_dataset.create_sparse_batch_stream.argtypes) == 7
     assert nnue_dataset.create_sparse_batch_stream_with_seed.argtypes[-1] is ctypes.c_uint64
 

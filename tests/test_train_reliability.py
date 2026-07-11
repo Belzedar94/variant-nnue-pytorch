@@ -54,6 +54,12 @@ def test_default_batch_size_depends_on_trainer_device():
     assert train.default_batch_size('cuda:0') == 16384
 
 
+def test_legacy_trainer_rejects_multi_device_or_multi_node_worlds():
+    train.require_single_device_trainer(SimpleNamespace(world_size=1))
+    with pytest.raises(ValueError, match='exactly one'):
+        train.require_single_device_trainer(SimpleNamespace(world_size=2))
+
+
 def test_same_training_and_validation_file_is_rejected(tmp_path):
     data = tmp_path / 'data.bin'
     data.write_bytes(b'x')

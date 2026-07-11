@@ -102,7 +102,8 @@ class TrainingDataProvider:
         filtered=False,
         random_fen_skipping=0,
         device='cpu',
-        seed=None):
+        seed=None,
+        get_error=None):
 
         self.feature_set = feature_set.encode('utf-8')
         self.create_stream = create_stream
@@ -117,6 +118,7 @@ class TrainingDataProvider:
         self.random_fen_skipping = _bounded_integer('random_fen_skipping', random_fen_skipping, 0, INT32_MAX)
         self.seed = None if seed is None else _bounded_integer('seed', seed, 0, UINT64_MAX)
         self.device = device
+        self.get_error = get_error
 
         stream_arguments = [
             self.feature_set,
@@ -145,6 +147,12 @@ class TrainingDataProvider:
             finally:
                 self.destroy_part(v)
         else:
+            if self.get_error is not None:
+                native_error = self.get_error(self.stream)
+                if native_error:
+                    if isinstance(native_error, bytes):
+                        native_error = native_error.decode('utf-8', errors='replace')
+                    raise RuntimeError('Native data loader failed: {}'.format(native_error))
             raise StopIteration
 
     def __del__(self):
@@ -182,6 +190,9 @@ destroy_sparse_batch_stream.restype = None
 fetch_next_sparse_batch = dll.fetch_next_sparse_batch
 fetch_next_sparse_batch.restype = SparseBatchPtr
 fetch_next_sparse_batch.argtypes = [ctypes.c_void_p]
+get_sparse_batch_stream_error = dll.get_sparse_batch_stream_error
+get_sparse_batch_stream_error.restype = ctypes.c_char_p
+get_sparse_batch_stream_error.argtypes = [ctypes.c_void_p]
 destroy_sparse_batch = dll.destroy_sparse_batch
 destroy_sparse_batch.argtypes = [SparseBatchPtr]
 destroy_sparse_batch.restype = None
@@ -202,7 +213,8 @@ class SparseBatchProvider(TrainingDataProvider):
             filtered,
             random_fen_skipping,
             device,
-            seed)
+            seed,
+            get_sparse_batch_stream_error)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
   def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', seed=0):
