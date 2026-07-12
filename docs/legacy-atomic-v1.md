@@ -44,7 +44,7 @@ The native library exports the read-only C ABI
 fresh dictionary:
 
 ```json
-{"schema_sha256":"758ac9239c2b1cff34cd10e185d9ee1bc7a400e2758bb1ce71171e1a1fa50a78","formats":{"legacy-atomic-v1":{"read":true,"write":false,"record_size":72}}}
+{"schema_sha256":"acca0f551f1c012c31a6c727dedccaebb7b5ebbc46810edb87e31bb208d5abe1","formats":{"legacy-atomic-v1":{"read":true,"write":false,"record_size":72}}}
 ```
 
 This is a capability handshake, not format negotiation. The loader only reads

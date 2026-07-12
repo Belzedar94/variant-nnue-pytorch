@@ -38,10 +38,15 @@ using namespace chess;
 static constexpr int MAX_PIECES = PIECE_COUNT;
 static constexpr int MAX_HAND_PIECES = POCKETS ? 2 * static_cast<int>(File::FILE_NB) : 0;
 
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) \
+  && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#  error "legacy-atomic-v1 requires a little-endian host"
+#endif
+
 namespace {
 
 constexpr char ATOMIC_TRAINING_DATA_SCHEMA_JSON[] =
-    "{\"schema_sha256\":\"758ac9239c2b1cff34cd10e185d9ee1bc7a400e2758bb1ce71171e1a1fa50a78\","
+    "{\"schema_sha256\":\"acca0f551f1c012c31a6c727dedccaebb7b5ebbc46810edb87e31bb208d5abe1\","
     "\"formats\":{\"legacy-atomic-v1\":{\"read\":true,\"write\":false,"
     "\"record_size\":72}}}";
 
