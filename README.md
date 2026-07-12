@@ -4,8 +4,9 @@ This is the chess variant NNUE training code for [Fairy-Stockfish](https://githu
 
 # Setup
 
-Requires a [CUDA capable GPU](https://developer.nvidia.com/cuda-gpus).
-Note: you don't need to download the CUDA Toolkit
+CUDA is recommended for full training speed, but the trainer and DataLoader
+also support CPU-only forward/backward runs. You do not need to download the
+CUDA Toolkit when using the packaged CUDA dependencies.
 
 #### Package dependencies
 
@@ -17,8 +18,17 @@ source env/bin/activate
 pip install -r requirements.txt
 ```
 
-PyTorch with CUDA 11.8 will be automatically installed, along with the matching CuPy version
-If your GPU is CUDA 12.8 capable you can use requirements-CUDA128.txt instead of requirements.txt
+PyTorch with CUDA 11.8 will be installed along with the matching CuPy version.
+If your GPU is CUDA 12.8 capable, use `requirements-CUDA128.txt` instead.
+Both files pin the NumPy and TorchMetrics compatibility bounds required by
+PyTorch Lightning 1.9.5.
+
+For CPU-only use on Windows or Linux, install the pinned CPU manifest. It omits
+CuPy and selects the portable PyTorch feature-transformer path automatically:
+
+```
+pip install -r requirements-CPU.txt
+```
 
 #### Build the fast DataLoader
 This requires a C++17 compiler and cmake.
@@ -33,6 +43,22 @@ Linux/Mac:
 sh compile_data_loader.bat
 ```
 
+# Tests
+
+Build the DataLoader first, then run the focused Python regression suite:
+
+```
+ctest --test-dir build -C Release --output-on-failure
+python -m pytest
+```
+
+CI installs that exact CPU manifest and runs the native and Python suites on
+both Linux and Windows. CUDA tests are optional in those public jobs and a skip
+is not release evidence. Set `ATOMIC_REQUIRE_CUDA_TESTS=1` on a CUDA/CuPy host
+to make missing CUDA support fail the suite. Maintainers can trigger the same
+required gate manually on a trusted runner labelled `self-hosted, cuda`; it is
+never scheduled for untrusted pull requests.
+
 # Train a network
 
 ```
@@ -40,65 +66,54 @@ source env/bin/activate
 python train.py train_data.bin val_data.bin
 ```
 
-## Resuming from a checkpoint
+Training and validation inputs must be different files. The escape hatch
+`--allow-train-as-validation` exists only for explicit smoke/debug runs and
+must not be used for real training or model comparison.
+
+The same seed controls model initialization and native random skipping. Native
+batch order is stable across worker counts; validation never applies random
+skipping, even when training does, and restarts from the beginning of its
+dedicated file for every validation pass.
+
+Smart FEN skipping retains the trainer's historical heuristic: positions with
+a teacher capture (including en passant) or a geometric orthodox check are
+skipped. It is a target-quality filter, not an Atomic legal-position oracle.
+
+## Resuming training
+
+Resume all Lightning state from a trusted checkpoint:
+
 ```
-python train.py --resume_from_checkpoint <path> ...
+python train.py train_data.bin val_data.bin --resume_from_checkpoint <path> ...
 ```
+
+Initialize a new training run from model weights or directly from a legacy
+Atomic V1 network:
+
+```
+python train.py train_data.bin val_data.bin \
+  --resume-from-model atomic_run3b_e202_l05.nnue \
+  --features="HalfKAv2^"
+```
+
+The `.nnue` header identifies the serialized real HalfKAv2 layout. The loader
+then adds the 768 zeroed factorizer rows required by `HalfKAv2^`; serializing
+immediately back to `.nnue` is byte-exact. See
+[`docs/legacy-atomic-v1.md`](docs/legacy-atomic-v1.md) for the frozen contract.
 
 ## Training on GPU
 ```
-python train.py --gpus 1 ...
+python train.py train_data.bin val_data.bin --accelerator gpu --devices 1 ...
 ```
+The Legacy Atomic V1 loader rejects a Lightning world size above one before it
+opens either dataset. Deterministic rank-aware sharding must be implemented
+before `--devices 2` or multi-node training can be supported safely.
 ## Feature set selection
 By default the trainer uses a factorized HalfKAv2 feature set (named "HalfKAv2^")
 If you wish to change the feature set used then you can use the `--features=NAME` option. For the list of available features see `--help`
 The default is:
 ```
 python train.py ... --features="HalfKAv2^"
-```
-
-## Skipping certain fens in the training
-
-`--smart-fen-skipping` currently skips over moves where the king is in check, or where the bestMove is a capture (typical of non-quiet positions).
-`--random-fen-skipping N` skip N fens on average before using one. Uses fewer fens per game, useful with large data sets.
-
-## Current recommended training invocation
-
-```
-python train.py --smart-fen-skipping --random-fen-skipping 3 --batch-size 16384 --threads 8 --num-workers 8 --gpus 1 trainingdata validationdata
-```
-best nets have been trained with 16B d9-scored nets, training runs >200 epochs
-
-
-
-# Export a network
-
-Using either a checkpoint (`.ckpt`) or serialized model (`.pt`),
-you can export to SF NNUE format.  This will convert `last.ckpt`
-to `nn.nnue`, which you can load directly in SF.
-```
-python serialize.py last.ckpt nn.nnue
-```
-
-# Import a network
-
-Import an existing SF NNUE network to the pytorch network format.
-```
-python serialize.py nn.nnue converted.pt
-```
-
-# Visualize a network
-
-Visualize a network from either a checkpoint (`.ckpt`), a serialized model (`.pt`)
-or a SF NNUE file (`.nnue`).
-```
-python visualize.py nn.nnue --features="HalfKAv2"
-```
-
-Visualize the difference between two networks from either a checkpoint (`.ckpt`), a serialized model (`.pt`)
-or a SF NNUE file (`.nnue`).
-```
-python visualize.py nn.nnue  --features="HalfKAv2" --ref-model nn.cpkt --ref-features="HalfKAv2^"
 ```
 
 # Logging
@@ -109,21 +124,3 @@ tensorboard --logdir=logs
 ```
 Then, go to http://localhost:6006/
 
-# Automatically run matches to determine the best net generated by a (running) training
-
-```
-python run_games.py --concurrency 16 --stockfish_exe ./stockfish.master --c_chess_exe ./c-chess-cli --ordo_exe ./ordo --book_file_name ./noob_3moves.epd run96
-```
-
-Automatically converts all `.ckpt` found under `run96` to `.nnue` and runs games to find the best net. Games are played using `c-chess-cli` and nets are ranked using `ordo`.
-This script runs in a loop, and will monitor the directory for new checkpoints. Can be run in parallel with the training, if idle cores are available.
-
-
-# Thanks
-
-* Sopel - for the amazing fast sparse data loader
-* connormcmonigle - https://github.com/connormcmonigle/seer-nnue, and loss function advice.
-* syzygy - http://www.talkchess.com/forum3/viewtopic.php?f=7&t=75506
-* https://github.com/DanielUranga/TensorFlowNNUE
-* https://hxim.github.io/Stockfish-Evaluation-Guide/
-* dkappe - Suggesting ranger (https://github.com/lessw2020/Ranger-Deep-Learning-Optimizer)
