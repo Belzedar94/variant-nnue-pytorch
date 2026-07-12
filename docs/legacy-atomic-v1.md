@@ -38,6 +38,21 @@ SHA-256:
 9749b7673746e51177327081b8982a7962e4f7fbeb80561f69dd16c953970b91
 ```
 
+The native library exports the read-only C ABI
+`get_atomic_training_data_schema_json()`. Python callers use
+`nnue_dataset.atomic_training_data_schema()` to receive the same metadata as a
+fresh dictionary:
+
+```json
+{"schema_sha256":"acca0f551f1c012c31a6c727dedccaebb7b5ebbc46810edb87e31bb208d5abe1","formats":{"legacy-atomic-v1":{"read":true,"write":false,"record_size":72}}}
+```
+
+This is a capability handshake, not format negotiation. The loader only reads
+headerless Legacy Atomic V1 `.bin` records, does not write datasets, and does
+not probe or fall back to the future `atomic-bin-v2` format. The C function
+returns a NUL-terminated pointer to immutable static storage that remains valid
+for the process lifetime; callers must neither modify nor free it.
+
 The seed is applied before model construction and is forwarded to the native
 stream. Input reads receive monotonically increasing sequence numbers while
 feature extraction may run concurrently, so yielded batch order is identical

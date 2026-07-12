@@ -1,5 +1,6 @@
 import numpy as np
 import ctypes
+import json
 import torch
 import os
 import sys
@@ -75,6 +76,35 @@ SparseBatchPtr = ctypes.POINTER(SparseBatch)
 
 INT32_MAX = 2**31 - 1
 UINT64_MAX = 2**64 - 1
+
+
+def _bind_atomic_training_data_schema(library):
+    try:
+        function = library.get_atomic_training_data_schema_json
+    except AttributeError as error:
+        raise RuntimeError(
+            'Training data loader does not expose the Atomic schema handshake; rebuild the native library'
+        ) from error
+    function.restype = ctypes.c_char_p
+    function.argtypes = []
+    return function
+
+
+get_atomic_training_data_schema_json = _bind_atomic_training_data_schema(dll)
+
+
+def atomic_training_data_schema():
+    """Return the native loader's read-only Atomic dataset capabilities."""
+    payload = get_atomic_training_data_schema_json()
+    if payload is None:
+        raise RuntimeError('Native data loader returned no Atomic training-data schema')
+    try:
+        document = json.loads(payload.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError('Native data loader returned invalid Atomic training-data schema JSON') from error
+    if not isinstance(document, dict):
+        raise RuntimeError('Native Atomic training-data schema must be a JSON object')
+    return document
 
 
 def _bounded_integer(name, value, minimum, maximum):

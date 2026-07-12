@@ -239,6 +239,16 @@ static void test_c_api_validation()
     assert(fetch_next_sparse_batch(nullptr) == nullptr);
 }
 
+static void test_atomic_training_data_schema_handshake()
+{
+    const char* schema_json = get_atomic_training_data_schema_json();
+    assert(schema_json != nullptr);
+    assert(std::string(schema_json) ==
+        "{\"schema_sha256\":\"acca0f551f1c012c31a6c727dedccaebb7b5ebbc46810edb87e31bb208d5abe1\","
+        "\"formats\":{\"legacy-atomic-v1\":{\"read\":true,\"write\":false,"
+        "\"record_size\":72}}}");
+}
+
 static void test_corrupt_full_size_records_fail_closed()
 {
     const auto valid = valid_legacy_record();
@@ -306,6 +316,7 @@ int main()
     test_smart_filter();
     test_seeded_random_skipping();
     test_c_api_validation();
+    test_atomic_training_data_schema_handshake();
     test_corrupt_full_size_records_fail_closed();
     return 0;
 }
