@@ -7,6 +7,47 @@ import torch
 import nnue_dataset
 
 
+def test_atomic_training_data_schema_handshake():
+    expected = {
+        'schema_sha256': '758ac9239c2b1cff34cd10e185d9ee1bc7a400e2758bb1ce71171e1a1fa50a78',
+        'formats': {
+            'legacy-atomic-v1': {
+                'read': True,
+                'write': False,
+                'record_size': 72,
+            },
+        },
+    }
+    first = nnue_dataset.atomic_training_data_schema()
+    second = nnue_dataset.atomic_training_data_schema()
+
+    assert first == expected
+    assert second == expected
+    assert first is not second
+    assert first['formats'] is not second['formats']
+
+
+@pytest.mark.parametrize(
+    ('payload', 'message'),
+    [
+        (None, 'returned no'),
+        (b'\xff', 'invalid'),
+        (b'not-json', 'invalid'),
+        (b'[]', 'must be a JSON object'),
+    ],
+)
+def test_atomic_training_data_schema_rejects_invalid_native_payloads(monkeypatch, payload, message):
+    monkeypatch.setattr(nnue_dataset, 'get_atomic_training_data_schema_json', lambda: payload)
+
+    with pytest.raises(RuntimeError, match=message):
+        nnue_dataset.atomic_training_data_schema()
+
+
+def test_atomic_training_data_schema_requires_native_symbol():
+    with pytest.raises(RuntimeError, match='rebuild the native library'):
+        nnue_dataset._bind_atomic_training_data_schema(object())
+
+
 def batch_digest(batch):
     digest = hashlib.sha256()
     for tensor in batch:

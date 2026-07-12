@@ -38,6 +38,20 @@ using namespace chess;
 static constexpr int MAX_PIECES = PIECE_COUNT;
 static constexpr int MAX_HAND_PIECES = POCKETS ? 2 * static_cast<int>(File::FILE_NB) : 0;
 
+namespace {
+
+constexpr char ATOMIC_TRAINING_DATA_SCHEMA_JSON[] =
+    "{\"schema_sha256\":\"758ac9239c2b1cff34cd10e185d9ee1bc7a400e2758bb1ce71171e1a1fa50a78\","
+    "\"formats\":{\"legacy-atomic-v1\":{\"read\":true,\"write\":false,"
+    "\"record_size\":72}}}";
+
+static_assert(
+    sizeof(bin::nodchip::PackedSfenValue) == 72,
+    "legacy-atomic-v1 schema metadata requires 72-byte records"
+);
+
+}
+
 static Square orient(Color color, Square sq)
 {
     if (color == Color::White)
@@ -813,6 +827,11 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered,
 }
 
 extern "C" {
+
+    EXPORT const char* CDECL get_atomic_training_data_schema_json()
+    {
+        return ATOMIC_TRAINING_DATA_SCHEMA_JSON;
+    }
 
     EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_with_seed(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping, std::uint64_t seed)
     {
