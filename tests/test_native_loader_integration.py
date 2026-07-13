@@ -27,6 +27,36 @@ def test_atomic_training_data_schema_handshake():
     assert first['formats'] is not second['formats']
 
 
+def test_plural_atomic_training_data_schema_handshake_adds_manifest_v2():
+    expected = {
+        'capability_version': 2,
+        'formats': {
+            'legacy-atomic-v1': {
+                'schema_sha256': 'acca0f551f1c012c31a6c727dedccaebb7b5ebbc46810edb87e31bb208d5abe1',
+                'read': True,
+                'write': False,
+                'header_size': 0,
+                'record_size': 72,
+            },
+            'atomic-bin-v2': {
+                'read': True,
+                'write': False,
+                'entrypoint': 'manifest',
+                'header_size': 96,
+                'record_size': 64,
+                'schema_sha256': '0352b036f2a140c609e3eb9c9d635dc553e8d77253d8faa92437390f5cf93cb6',
+                'manifest_schema_sha256': '83d63922df3ac4a0c81a21ec9d9fd9e180efe50f26efee62fe01710e09da5b42',
+            },
+        },
+    }
+    assert nnue_dataset.atomic_training_data_schemas() == expected
+
+
+def test_plural_atomic_training_data_schema_requires_native_symbol():
+    with pytest.raises(RuntimeError, match='plural Atomic schema handshake'):
+        nnue_dataset._bind_atomic_training_data_schemas(object())
+
+
 @pytest.mark.parametrize(
     ('payload', 'message'),
     [
@@ -183,6 +213,45 @@ def test_native_batch_is_destroyed_when_tensor_conversion_fails(monkeypatch):
     finally:
         provider.__del__()
     assert destroyed == [pointer]
+
+
+def test_raw_atomic_bin_v2_creation_error_is_exposed():
+    with pytest.raises(RuntimeError, match='raw shards are not dataset entrypoints'):
+        nnue_dataset.SparseBatchProvider(
+            'HalfKAv2',
+            'raw.atbin',
+            1,
+            cyclic=False,
+            num_workers=1,
+            filtered=False,
+            random_fen_skipping=0,
+            device='cpu',
+            seed=0,
+        )
+
+
+def test_python_provider_reads_manifest_v2_from_unicode_path(atomic_v2_manifest):
+    provider = nnue_dataset.SparseBatchProvider(
+        'HalfKAv2',
+        str(atomic_v2_manifest),
+        2,
+        cyclic=False,
+        num_workers=2,
+        filtered=True,
+        random_fen_skipping=0,
+        device='cpu',
+        seed=0,
+    )
+    try:
+        batch = next(provider)
+        assert batch[0].shape == (1, 1)
+        assert batch[0].item() == 1.0
+        assert batch[6].item() == 0.0
+        assert batch[7].item() == -123.0
+        with pytest.raises(StopIteration):
+            next(provider)
+    finally:
+        provider.__del__()
 
 
 def test_full_size_corrupt_record_propagates_native_error(atomic_legacy_32, tmp_path):

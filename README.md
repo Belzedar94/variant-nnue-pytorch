@@ -66,6 +66,32 @@ source env/bin/activate
 python train.py train_data.bin val_data.bin
 ```
 
+Atomic BIN V2 datasets use their authenticated manifests instead of raw
+shards:
+
+```bash
+python train.py train.atbin.manifest.json val.atbin.manifest.json
+```
+
+See [docs/atomic-bin-v2.md](docs/atomic-bin-v2.md) for the pinned reader,
+schema and generator-policy contract.
+
+## License of the native loader
+
+`training_data_loader` statically links selected source files from
+[Atomic-Stockfish](https://github.com/Belzedar94/Atomic-Stockfish), which is
+derived from Stockfish. The linked native component is distributed under the
+GNU General Public License version 3 or any later version
+(`GPL-3.0-or-later`). See [Copying.txt](Copying.txt) for the complete license
+and [`external/Atomic-Stockfish/AUTHORS`](external/Atomic-Stockfish/AUTHORS)
+for the upstream authors. Copyright 2004-2026 The Stockfish developers and
+other contributors.
+
+The corresponding source for a built loader is this repository at the exact
+trainer commit together with its recursively checked-out Atomic-Stockfish
+submodule. The authenticated engine pin is documented in
+[docs/atomic-bin-v2.md](docs/atomic-bin-v2.md).
+
 Training and validation inputs must be different files. The escape hatch
 `--allow-train-as-validation` exists only for explicit smoke/debug runs and
 must not be used for real training or model comparison.
@@ -75,9 +101,11 @@ batch order is stable across worker counts; validation never applies random
 skipping, even when training does, and restarts from the beginning of its
 dedicated file for every validation pass.
 
-Smart FEN skipping retains the trainer's historical heuristic: positions with
-a teacher capture (including en passant) or a geometric orthodox check are
-skipped. It is a target-quality filter, not an Atomic legal-position oracle.
+For Legacy `.bin` input, smart FEN skipping retains the trainer's historical
+heuristic: positions with a teacher capture (including en passant) or a
+geometric orthodox check are skipped. It is not an Atomic legal-position
+oracle and is therefore bypassed for V2; V2 reports and trusts the authenticated
+generator policy in its manifest.
 
 ## Resuming training
 

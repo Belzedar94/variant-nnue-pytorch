@@ -172,7 +172,7 @@ namespace chess
         KNB = KING_SQUARES,
     };
 
-    inline Square make_square(File f, Rank r) {
+    constexpr Square make_square(File f, Rank r) {
         return Square(std::uint8_t(File::FILE_NB) * std::uint8_t(r) + std::uint8_t(f));
     }
 
@@ -199,6 +199,7 @@ namespace chess
     ENABLE_INCR_OPERATORS_ON(File);
     ENABLE_INCR_OPERATORS_ON(Rank);
     ENABLE_INCR_OPERATORS_ON(PieceType);
+    #undef ENABLE_INCR_OPERATORS_ON
 
     enum struct MoveType : std::uint8_t
     {
@@ -370,8 +371,13 @@ namespace chess
             m_sideToMove(Color::White),
             m_epSquare(Square::NB),
             m_castlingRights(CastlingRights::All),
+            m_castlingRookOrigins{
+                make_square(File::FILE_H, Rank::RANK_1),
+                make_square(File::FILE_A, Rank::RANK_1),
+                make_square(File::FILE_H, Rank::RANK_8),
+                make_square(File::FILE_A, Rank::RANK_8)},
             m_rule50Counter(0),
-            m_ply(0)
+            m_fullmove(1)
         {
         }
 
@@ -380,8 +386,13 @@ namespace chess
             m_sideToMove(sideToMove),
             m_epSquare(epSquare),
             m_castlingRights(castlingRights),
+            m_castlingRookOrigins{
+                make_square(File::FILE_H, Rank::RANK_1),
+                make_square(File::FILE_A, Rank::RANK_1),
+                make_square(File::FILE_H, Rank::RANK_8),
+                make_square(File::FILE_A, Rank::RANK_8)},
             m_rule50Counter(0),
-            m_ply(0)
+            m_fullmove(1)
         {
         }
 
@@ -405,19 +416,40 @@ namespace chess
             m_castlingRights = rights;
         }
 
-        constexpr void setRule50Counter(std::uint8_t v)
+        [[nodiscard]] constexpr CastlingRights castlingRights() const
+        {
+            return m_castlingRights;
+        }
+
+        constexpr void setCastlingRookOrigin(std::size_t index, Square square)
+        {
+            if (index >= m_castlingRookOrigins.size())
+                throw std::invalid_argument("castling-rook origin index is outside its domain");
+            m_castlingRookOrigins[index] = square;
+        }
+
+        [[nodiscard]] constexpr Square castlingRookOrigin(std::size_t index) const
+        {
+            if (index >= m_castlingRookOrigins.size())
+                throw std::invalid_argument("castling-rook origin index is outside its domain");
+            return m_castlingRookOrigins[index];
+        }
+
+        constexpr void setRule50Counter(std::uint16_t v)
         {
             m_rule50Counter = v;
         }
 
-        constexpr void setPly(std::uint16_t ply)
+        constexpr void setPly(std::uint32_t ply)
         {
-            m_ply = ply;
+            m_fullmove = static_cast<std::uint32_t>((std::uint64_t(ply) + 1) / 2);
         }
 
-        inline void setFullMove(std::uint16_t hm)
+        inline void setFullMove(std::uint32_t fullmove)
         {
-            m_ply = 2 * hm - 1 + (m_sideToMove == Color::Black);
+            if (fullmove == 0)
+                throw std::invalid_argument("fullmove number must be positive");
+            m_fullmove = fullmove;
         }
 
         [[nodiscard]] constexpr Color sideToMove() const
@@ -425,29 +457,29 @@ namespace chess
             return m_sideToMove;
         }
 
-        [[nodiscard]] inline std::uint8_t rule50Counter() const
+        [[nodiscard]] inline std::uint16_t rule50Counter() const
         {
             return m_rule50Counter;
         }
 
-        [[nodiscard]] inline std::uint16_t ply() const
+        [[nodiscard]] inline std::uint64_t ply() const
         {
-            return m_ply;
+            return 2ULL * m_fullmove - 1
+                + static_cast<std::uint64_t>(m_sideToMove == Color::Black);
         }
 
-        [[nodiscard]] inline std::uint16_t fullMove() const
+        [[nodiscard]] inline std::uint32_t fullMove() const
         {
-            return (m_ply + 1) / 2;
+            return m_fullmove;
         }
 
     protected:
         Color m_sideToMove;
         Square m_epSquare;
         CastlingRights m_castlingRights;
-        std::uint8_t m_rule50Counter;
-        std::uint16_t m_ply;
-
-        static_assert(sizeof(Color) + sizeof(Square) + sizeof(CastlingRights) + sizeof(std::uint8_t) == 4);
+        std::array<Square, 4> m_castlingRookOrigins;
+        std::uint16_t m_rule50Counter;
+        std::uint32_t m_fullmove;
     };
 
 }
@@ -810,14 +842,26 @@ namespace bin
         }
     }
 
+    enum TrainingDataFlags : std::uint32_t
+    {
+        NoTrainingDataFlags = 0,
+        TrainingDataAtomic960 = 1U << 0
+    };
+
     struct TrainingDataEntry
     {
         chess::Position pos;
         chess::Move move;
-        std::int16_t score;
-        std::uint16_t ply;
-        std::int16_t result;
+        std::int32_t score{};
+        std::uint32_t ply{};
+        std::int8_t result{};
+        std::uint32_t flags{NoTrainingDataFlags};
     };
+
+    static_assert(sizeof(decltype(TrainingDataEntry::score)) == 4);
+    static_assert(sizeof(decltype(TrainingDataEntry::ply)) == 4);
+    static_assert(sizeof(decltype(chess::Position{}.rule50Counter())) == 2);
+    static_assert(sizeof(decltype(chess::Position{}.fullMove())) == 4);
 
     inline void validate_training_move(const chess::Position& pos, const chess::Move& move)
     {

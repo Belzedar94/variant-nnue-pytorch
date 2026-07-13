@@ -9,6 +9,9 @@ def test_seeded_native_loader_binding_is_available():
     assert hasattr(nnue_dataset.dll, "create_sparse_batch_stream")
     assert hasattr(nnue_dataset.dll, "create_sparse_batch_stream_with_seed")
     assert hasattr(nnue_dataset.dll, "get_sparse_batch_stream_error")
+    assert hasattr(nnue_dataset.dll, "get_sparse_batch_stream_creation_error")
+    assert hasattr(nnue_dataset.dll, "get_atomic_training_data_schemas_json")
+    assert hasattr(nnue_dataset.dll, "validate_training_validation_data_paths")
     assert len(nnue_dataset.create_sparse_batch_stream.argtypes) == 7
     assert nnue_dataset.create_sparse_batch_stream_with_seed.argtypes[-1] is ctypes.c_uint64
 

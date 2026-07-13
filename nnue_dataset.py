@@ -93,18 +93,45 @@ def _bind_atomic_training_data_schema(library):
 get_atomic_training_data_schema_json = _bind_atomic_training_data_schema(dll)
 
 
-def atomic_training_data_schema():
-    """Return the native loader's read-only Atomic dataset capabilities."""
-    payload = get_atomic_training_data_schema_json()
+def _bind_atomic_training_data_schemas(library):
+    try:
+        function = library.get_atomic_training_data_schemas_json
+    except AttributeError as error:
+        raise RuntimeError(
+            'Training data loader does not expose the plural Atomic schema handshake; rebuild the native library'
+        ) from error
+    function.restype = ctypes.c_char_p
+    function.argtypes = []
+    return function
+
+
+get_atomic_training_data_schemas_json = _bind_atomic_training_data_schemas(dll)
+
+
+def _decode_schema_payload(payload, label):
     if payload is None:
-        raise RuntimeError('Native data loader returned no Atomic training-data schema')
+        raise RuntimeError('Native data loader returned no {}'.format(label))
     try:
         document = json.loads(payload.decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError('Native data loader returned invalid Atomic training-data schema JSON') from error
+        raise RuntimeError('Native data loader returned invalid {} JSON'.format(label)) from error
     if not isinstance(document, dict):
-        raise RuntimeError('Native Atomic training-data schema must be a JSON object')
+        raise RuntimeError('Native {} must be a JSON object'.format(label))
     return document
+
+
+def atomic_training_data_schema():
+    """Return the byte-stable Legacy Atomic V1 schema handshake."""
+    return _decode_schema_payload(
+        get_atomic_training_data_schema_json(),
+        'Atomic training-data schema')
+
+
+def atomic_training_data_schemas():
+    """Return the additive Legacy V1 plus manifest-only Atomic BIN V2 capabilities."""
+    return _decode_schema_payload(
+        get_atomic_training_data_schemas_json(),
+        'Atomic training-data schemas')
 
 
 def _bounded_integer(name, value, minimum, maximum):
@@ -133,7 +160,8 @@ class TrainingDataProvider:
         random_fen_skipping=0,
         device='cpu',
         seed=None,
-        get_error=None):
+        get_error=None,
+        get_creation_error=None):
 
         self.feature_set = feature_set.encode('utf-8')
         self.create_stream = create_stream
@@ -149,6 +177,7 @@ class TrainingDataProvider:
         self.seed = None if seed is None else _bounded_integer('seed', seed, 0, UINT64_MAX)
         self.device = device
         self.get_error = get_error
+        self.get_creation_error = get_creation_error
 
         stream_arguments = [
             self.feature_set,
@@ -163,6 +192,11 @@ class TrainingDataProvider:
             stream_arguments.append(self.seed)
         self.stream = self.create_stream(*stream_arguments)
         if not self.stream:
+            native_error = self.get_creation_error() if self.get_creation_error is not None else None
+            if native_error:
+                if isinstance(native_error, bytes):
+                    native_error = native_error.decode('utf-8', errors='replace')
+                raise RuntimeError('Native data loader rejected the stream: {}'.format(native_error))
             raise RuntimeError('Native data loader rejected the stream configuration')
 
     def __iter__(self):
@@ -213,6 +247,12 @@ create_sparse_batch_stream_with_seed.argtypes = [
     ctypes.c_int,     # random_fen_skipping
     ctypes.c_uint64   # deterministic random-skip seed
 ]
+get_sparse_batch_stream_creation_error = dll.get_sparse_batch_stream_creation_error
+get_sparse_batch_stream_creation_error.restype = ctypes.c_char_p
+get_sparse_batch_stream_creation_error.argtypes = []
+validate_training_validation_data_paths_native = dll.validate_training_validation_data_paths
+validate_training_validation_data_paths_native.restype = ctypes.c_char_p
+validate_training_validation_data_paths_native.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 destroy_sparse_batch_stream = dll.destroy_sparse_batch_stream
 destroy_sparse_batch_stream.argtypes = [ctypes.c_void_p]
 destroy_sparse_batch_stream.restype = None
@@ -226,6 +266,15 @@ get_sparse_batch_stream_error.argtypes = [ctypes.c_void_p]
 destroy_sparse_batch = dll.destroy_sparse_batch
 destroy_sparse_batch.argtypes = [SparseBatchPtr]
 destroy_sparse_batch.restype = None
+
+
+def validate_training_validation_data_paths(training_path, validation_path):
+    """Reject V2 train/validation manifests sharing a shard hash or file identity."""
+    error = validate_training_validation_data_paths_native(
+        os.fsencode(training_path),
+        os.fsencode(validation_path))
+    if error:
+        raise ValueError(error.decode('utf-8', errors='replace'))
 
 
 class SparseBatchProvider(TrainingDataProvider):
@@ -244,7 +293,8 @@ class SparseBatchProvider(TrainingDataProvider):
             random_fen_skipping,
             device,
             seed,
-            get_sparse_batch_stream_error)
+            get_sparse_batch_stream_error,
+            get_sparse_batch_stream_creation_error)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
   def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', seed=0):
