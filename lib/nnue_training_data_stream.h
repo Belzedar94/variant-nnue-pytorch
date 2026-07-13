@@ -158,7 +158,7 @@ namespace training_data {
 
             const auto& options = m_reader->manifest().options;
             std::clog
-                << "Atomic BIN V2 manifest policy: use_nnue=pure eval_limit=" << options.evalLimit
+                << "Atomic BIN V2 manifest policy: eval_limit=" << options.evalLimit
                 << " filter_captures=" << (options.filterCaptures ? "true" : "false")
                 << " filter_promotions=" << (options.filterPromotions ? "true" : "false")
                 << " filter_checks=" << (options.filterChecks ? "true" : "false")

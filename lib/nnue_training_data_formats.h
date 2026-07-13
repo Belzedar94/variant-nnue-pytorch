@@ -295,7 +295,7 @@ namespace chess
             m_pieces{},
             m_pocketCount{},
             m_pieceCount{},
-            m_kings{}
+            m_kings{Square::NB, Square::NB}
         {
             std::fill_n(m_pieces, static_cast<uint8_t>(Square::NB), Piece::None);
         }

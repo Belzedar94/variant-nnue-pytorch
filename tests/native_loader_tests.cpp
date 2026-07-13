@@ -521,6 +521,8 @@ static void test_atomic_bin_v2_manifest_only_roundtrip()
 static void test_widened_internal_position_boundaries()
 {
     chess::Position position;
+    assert(position.kingSquare(Color::White) == chess::Square::NB);
+    assert(position.kingSquare(Color::Black) == chess::Square::NB);
     position.setRule50Counter(std::numeric_limits<std::uint16_t>::max());
     position.setFullMove(std::numeric_limits<std::uint32_t>::max());
     position.setSideToMove(Color::Black);
@@ -528,6 +530,32 @@ static void test_widened_internal_position_boundaries()
     assert(position.rule50Counter() == std::numeric_limits<std::uint16_t>::max());
     assert(position.fullMove() == std::numeric_limits<std::uint32_t>::max());
     assert(position.ply() == 2ULL * std::numeric_limits<std::uint32_t>::max());
+}
+
+static void test_v2_adapter_defensively_preserves_missing_king_sentinel()
+{
+    // The authenticated V2 schema currently requires both kings. This direct
+    // adapter test protects the internal Position invariant if a future schema
+    // permits terminal records; it does not weaken the current reader.
+    Stockfish::Data::AtomicBinV2DecodedRecord decoded{};
+    auto& fields = decoded.fields;
+    fields.position.board.fill(Stockfish::Data::ATOMIC_BIN_V2_EMPTY);
+    fields.position.board[static_cast<std::size_t>(Stockfish::SQ_E8)] =
+        Stockfish::Data::ATOMIC_BIN_V2_BLACK_KING;
+    fields.position.board[static_cast<std::size_t>(Stockfish::SQ_A2)] =
+        Stockfish::Data::ATOMIC_BIN_V2_WHITE_PAWN;
+    fields.position.sideToMove = Stockfish::Data::ATOMIC_BIN_V2_WHITE_TO_MOVE;
+    fields.position.enPassantSquare = Stockfish::Data::AtomicBinV2NoSquare;
+    fields.position.castlingRookOrigins.fill(Stockfish::Data::AtomicBinV2NoSquare);
+    fields.position.fullmove = 1;
+    fields.move.from = static_cast<Stockfish::u8>(Stockfish::SQ_A2);
+    fields.move.to = static_cast<Stockfish::u8>(Stockfish::SQ_A3);
+    fields.move.type = Stockfish::Data::ATOMIC_BIN_V2_NORMAL;
+    fields.move.promotion = Stockfish::Data::ATOMIC_BIN_V2_NO_PROMOTION;
+
+    const auto entry = training_data::atomic_bin_v2::to_training_data_entry(decoded);
+    assert(entry.pos.kingSquare(Color::White) == chess::Square::NB);
+    assert(entry.pos.kingSquare(Color::Black) == sq(4, 7));
 }
 
 static void test_atomic_bin_v2_atomic960_and_stm_semantics()
@@ -769,6 +797,39 @@ static void test_atomic_bin_v2_corruption_and_schema_fail_closed()
         assert(std::string(get_sparse_batch_stream_creation_error()).find("SHA-256")
             != std::string::npos);
 
+    auto missing_king = create_v2_dataset(temporary.path, "missing-king", sample);
+    {
+        std::fstream shard(
+            missing_king.shard,
+            std::ios::in | std::ios::out | std::ios::binary);
+        assert(shard);
+        shard.seekg(static_cast<std::streamoff>(AtomicData::AtomicBinV2HeaderSize));
+        char first_board_byte = 0;
+        shard.read(&first_board_byte, 1);
+        assert(shard);
+        first_board_byte = static_cast<char>(
+            static_cast<unsigned char>(first_board_byte) & 0xF0U);
+        shard.seekp(static_cast<std::streamoff>(AtomicData::AtomicBinV2HeaderSize));
+        shard.write(&first_board_byte, 1);
+        assert(shard);
+    }
+    std::string missing_king_sha256;
+    Stockfish::u64 missing_king_size = 0;
+    assert(AtomicData::sha256_file(
+        missing_king.shard,
+        missing_king_sha256,
+        missing_king_size));
+    missing_king.metadata.shards.front().sha256 = std::move(missing_king_sha256);
+    assert(write_v2_manifest(missing_king.metadata));
+    const auto missing_king_manifest = utf8_path(missing_king.manifest);
+    stream = create_sparse_batch_stream_with_seed(
+        "HalfKAv2", 1, missing_king_manifest.c_str(), 1, false, false, 0, 0);
+    assert(stream != nullptr);
+    assert(fetch_next_sparse_batch(stream) == nullptr);
+    assert(std::string(get_sparse_batch_stream_error(stream)).find("king")
+        != std::string::npos);
+    destroy_sparse_batch_stream(stream);
+
     auto schema = create_v2_dataset(temporary.path, "schema", sample);
     std::ifstream input(schema.manifest, std::ios::binary);
     std::string json((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
@@ -897,6 +958,7 @@ int main()
     test_atomic_training_data_schema_handshake();
     test_atomic_bin_v2_manifest_only_roundtrip();
     test_widened_internal_position_boundaries();
+    test_v2_adapter_defensively_preserves_missing_king_sentinel();
     test_atomic_bin_v2_atomic960_and_stm_semantics();
     test_atomic_bin_v2_multishard_eof_partial_and_determinism();
     test_atomic_bin_v2_halfkav2_sparse_parity_with_legacy72();
