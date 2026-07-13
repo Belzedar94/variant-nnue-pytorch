@@ -11,11 +11,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(ATOMIC_STOCKFISH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/Atomic-Stockfish")
-set(ATOMIC_STOCKFISH_PIN "1e64c6f16e8c327be6ee5e3de57ed54d1079f060")
+set(ATOMIC_STOCKFISH_PIN "76764c3c01ce5965a793a65e4580dd5c95cd2916")
 set(ATOMIC_BIN_V2_DATA_SCHEMA_SHA256
   "0352b036f2a140c609e3eb9c9d635dc553e8d77253d8faa92437390f5cf93cb6")
 set(ATOMIC_BIN_V2_MANIFEST_SCHEMA_SHA256
   "83d63922df3ac4a0c81a21ec9d9fd9e180efe50f26efee62fe01710e09da5b42")
+set(ATOMIC_DATA_TOOLS_DECODE_SCHEMA_SHA256
+  "5e3f8d7c6db6ee955b71747ee063859e15609adb557a3754228a606f3df2caad")
 if(NOT EXISTS "${ATOMIC_STOCKFISH_ROOT}/src/data/atomic_bin_v2_reader.cpp")
   message(FATAL_ERROR
     "Atomic-Stockfish submodule is missing; run git submodule update --init --recursive")
@@ -85,11 +87,17 @@ file(SHA256
 file(SHA256
   "${ATOMIC_STOCKFISH_ROOT}/schemas/atomic-bin-v2-manifest.json"
   ATOMIC_BIN_V2_MANIFEST_SCHEMA_ACTUAL)
+file(SHA256
+  "${ATOMIC_STOCKFISH_ROOT}/schemas/atomic-data-tools-decode-v1.json"
+  ATOMIC_DATA_TOOLS_DECODE_SCHEMA_ACTUAL)
 if(NOT ATOMIC_BIN_V2_DATA_SCHEMA_ACTUAL STREQUAL ATOMIC_BIN_V2_DATA_SCHEMA_SHA256)
   message(FATAL_ERROR "Pinned Atomic BIN V2 data schema hash differs")
 endif()
 if(NOT ATOMIC_BIN_V2_MANIFEST_SCHEMA_ACTUAL STREQUAL ATOMIC_BIN_V2_MANIFEST_SCHEMA_SHA256)
   message(FATAL_ERROR "Pinned Atomic BIN V2 manifest schema hash differs")
+endif()
+if(NOT ATOMIC_DATA_TOOLS_DECODE_SCHEMA_ACTUAL STREQUAL ATOMIC_DATA_TOOLS_DECODE_SCHEMA_SHA256)
+  message(FATAL_ERROR "Pinned Atomic data-tools decode schema hash differs")
 endif()
 
 add_library(atomic_bin_v2_reader_core STATIC
