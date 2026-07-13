@@ -12,10 +12,12 @@
 #include <exception>
 #include <iterator>
 #include <future>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <random>
 #include <stdexcept>
@@ -23,10 +25,13 @@
 
 #include "lib/nnue_training_data_formats.h"
 #include "lib/nnue_training_data_stream.h"
+#include "lib/dataset_file_identity.h"
 
 #if defined(_WIN32)
 #define EXPORT __declspec(dllexport)
+#ifndef CDECL
 #define CDECL __cdecl
+#endif
 #else
 #define EXPORT
 #define CDECL
@@ -45,10 +50,120 @@ static constexpr int MAX_HAND_PIECES = POCKETS ? 2 * static_cast<int>(File::FILE
 
 namespace {
 
+thread_local std::array<char, 1024> g_creation_error{};
+thread_local std::array<char, 1024> g_dataset_pair_error{};
+
+using training_data::platform::DatasetFileIdentity;
+using training_data::platform::dataset_file_identity;
+
+void set_creation_error(const char* message) noexcept
+{
+    std::snprintf(
+        g_creation_error.data(),
+        g_creation_error.size(),
+        "%s",
+        message == nullptr ? "unknown native loader creation error" : message);
+}
+
+const char* validate_dataset_pair(const char* training_path, const char* validation_path) noexcept
+{
+    g_dataset_pair_error[0] = '\0';
+    const auto fail = [](const std::string& message) -> const char* {
+        std::snprintf(
+            g_dataset_pair_error.data(),
+            g_dataset_pair_error.size(),
+            "%s",
+            message.c_str());
+        return g_dataset_pair_error.data();
+    };
+
+    if (training_path == nullptr || validation_path == nullptr)
+        return fail("training and validation paths must not be null");
+
+    const std::string training(training_path);
+    const std::string validation(validation_path);
+    if (training_data::has_extension(training, "atbin")
+        || training_data::has_extension(validation, "atbin"))
+        return fail(
+            "Atomic BIN V2 raw shards are not dataset entrypoints; use .atbin.manifest.json sidecars");
+
+    if (!training_data::is_atomic_bin_v2_manifest(training)
+        || !training_data::is_atomic_bin_v2_manifest(validation))
+        return nullptr;
+
+    try
+    {
+        std::unique_ptr<Stockfish::Data::AtomicBinV2DatasetReader> training_reader;
+        std::unique_ptr<Stockfish::Data::AtomicBinV2DatasetReader> validation_reader;
+        auto opened = Stockfish::Data::AtomicBinV2DatasetReader::open(
+            std::filesystem::u8path(training), training_reader);
+        if (!opened)
+            return fail("invalid training manifest: " + opened.message);
+        opened = Stockfish::Data::AtomicBinV2DatasetReader::open(
+            std::filesystem::u8path(validation), validation_reader);
+        if (!opened)
+            return fail("invalid validation manifest: " + opened.message);
+
+        const auto& training_shards = training_reader->manifest().shards;
+        const auto& validation_shards = validation_reader->manifest().shards;
+        std::map<std::string, std::size_t> hash_indices;
+        std::map<std::filesystem::path, std::size_t> path_indices;
+        std::map<DatasetFileIdentity, std::size_t> identity_indices;
+        for (std::size_t index = 0; index < training_shards.size(); ++index)
+        {
+            const auto& shard = training_shards[index];
+            hash_indices.emplace(shard.sha256, index);
+            path_indices.emplace(shard.path.lexically_normal(), index);
+            if (const auto identity = dataset_file_identity(shard.path))
+                identity_indices.emplace(*identity, index);
+        }
+        for (std::size_t validation_index = 0;
+             validation_index < validation_shards.size();
+             ++validation_index)
+        {
+            const auto& shard = validation_shards[validation_index];
+            std::optional<std::size_t> training_index;
+            if (const auto found = hash_indices.find(shard.sha256); found != hash_indices.end())
+                training_index = found->second;
+            else if (const auto found = path_indices.find(shard.path.lexically_normal());
+                     found != path_indices.end())
+                training_index = found->second;
+            else if (const auto identity = dataset_file_identity(shard.path))
+                if (const auto found = identity_indices.find(*identity);
+                    found != identity_indices.end())
+                    training_index = found->second;
+
+            if (training_index)
+                return fail(
+                    "training and validation Atomic BIN V2 manifests overlap at train shard "
+                    + std::to_string(*training_index) + " and validation shard "
+                    + std::to_string(validation_index));
+        }
+        return nullptr;
+    }
+    catch (const std::exception& error)
+    {
+        return fail(std::string("cannot validate training/validation manifests: ") + error.what());
+    }
+    catch (...)
+    {
+        return fail("cannot validate training/validation manifests: unknown native error");
+    }
+}
+
 constexpr char ATOMIC_TRAINING_DATA_SCHEMA_JSON[] =
     "{\"schema_sha256\":\"acca0f551f1c012c31a6c727dedccaebb7b5ebbc46810edb87e31bb208d5abe1\","
     "\"formats\":{\"legacy-atomic-v1\":{\"read\":true,\"write\":false,"
     "\"record_size\":72}}}";
+
+constexpr char ATOMIC_TRAINING_DATA_SCHEMAS_JSON[] =
+    "{\"capability_version\":2,\"formats\":{\"legacy-atomic-v1\":{"
+    "\"schema_sha256\":\"acca0f551f1c012c31a6c727dedccaebb7b5ebbc46810edb87e31bb208d5abe1\","
+    "\"read\":true,\"write\":false,\"header_size\":0,\"record_size\":72},"
+    "\"atomic-bin-v2\":{\"read\":true,\"write\":false,"
+    "\"entrypoint\":\"manifest\",\"header_size\":96,\"record_size\":64,"
+    "\"schema_sha256\":\"0352b036f2a140c609e3eb9c9d635dc553e8d77253d8faa92437390f5cf93cb6\","
+    "\"manifest_schema_sha256\":\"83d63922df3ac4a0c81a21ec9d9fd9e180efe50f26efee62fe01710e09da5b42\"}}}";
 
 static_assert(
     sizeof(bin::nodchip::PackedSfenValue) == 72,
@@ -419,7 +534,7 @@ private:
     {
         is_white[i] = static_cast<float>(e.pos.sideToMove() == Color::White);
         outcome[i] = (e.result + 1.0f) / 2.0f;
-        score[i] = e.score;
+        score[i] = static_cast<float>(e.score);
         psqt_indices[i] = (e.pos.pieceCount() - 1) * 8 / MAX_PIECES;
         layer_stack_indices[i] = psqt_indices[i];
         fill_features(FeatureSet<Ts...>{}, i, e);
@@ -452,14 +567,18 @@ struct Stream : AnyStream
         m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename, cyclic, skipPredicate))
     {
         if (!m_stream)
-            throw std::invalid_argument("Unsupported training-data file (expected a .bin file)");
+            throw std::invalid_argument(
+                "Unsupported training-data file (expected .bin or .atbin.manifest.json)");
 
-        std::ifstream input(filename, std::ios::binary | std::ios::ate);
-        if (!input)
-            throw std::invalid_argument("Could not open the training-data file");
-        const auto size = static_cast<std::streamoff>(input.tellg());
-        if (size <= 0 || size % static_cast<std::streamoff>(sizeof(bin::nodchip::PackedSfenValue)) != 0)
-            throw std::invalid_argument("Legacy training-data size must be a positive multiple of 72 bytes");
+        if (training_data::has_extension(filename, training_data::BinSfenInputStream::extension))
+        {
+            std::ifstream input(filename, std::ios::binary | std::ios::ate);
+            if (!input)
+                throw std::invalid_argument("Could not open the training-data file");
+            const auto size = static_cast<std::streamoff>(input.tellg());
+            if (size <= 0 || size % static_cast<std::streamoff>(sizeof(bin::nodchip::PackedSfenValue)) != 0)
+                throw std::invalid_argument("Legacy training-data size must be a positive multiple of 72 bytes");
+        }
     }
 
     virtual StorageT* next() = 0;
@@ -838,22 +957,48 @@ extern "C" {
         return ATOMIC_TRAINING_DATA_SCHEMA_JSON;
     }
 
+    EXPORT const char* CDECL get_atomic_training_data_schemas_json()
+    {
+        return ATOMIC_TRAINING_DATA_SCHEMAS_JSON;
+    }
+
+    EXPORT const char* CDECL get_sparse_batch_stream_creation_error()
+    {
+        return g_creation_error.data();
+    }
+
+    EXPORT const char* CDECL validate_training_validation_data_paths(
+        const char* training_path,
+        const char* validation_path)
+    {
+        return validate_dataset_pair(training_path, validation_path);
+    }
+
     EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_with_seed(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping, std::uint64_t seed)
     {
+        g_creation_error[0] = '\0';
         if (feature_set_c == nullptr || filename == nullptr)
         {
-            fprintf(stderr, "feature_set and filename must not be null\n");
+            set_creation_error("feature_set and filename must not be null");
+            fprintf(stderr, "%s\n", g_creation_error.data());
             return nullptr;
         }
         if (concurrency < 1 || batch_size < 1 || random_fen_skipping < 0)
         {
-            fprintf(stderr, "Invalid loader configuration: concurrency and batch_size must be positive, random_fen_skipping must be non-negative\n");
+            set_creation_error("Invalid loader configuration: concurrency and batch_size must be positive, random_fen_skipping must be non-negative");
+            fprintf(stderr, "%s\n", g_creation_error.data());
             return nullptr;
         }
 
         try
         {
-            auto skipPredicate = make_skip_predicate(filtered, random_fen_skipping, seed);
+            const bool atomic_bin_v2 = training_data::is_atomic_bin_v2_manifest(filename);
+            if (atomic_bin_v2 && filtered)
+                fprintf(stderr, "Atomic BIN V2 ignores trainer-side smart filtering; using the authenticated generator manifest policy\n");
+            auto skipPredicate = make_skip_predicate(
+                atomic_bin_v2 ? false : filtered,
+                random_fen_skipping,
+                seed);
             std::string_view feature_set(feature_set_c);
             if (feature_set == "HalfKP")
                 return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
@@ -868,16 +1013,20 @@ extern "C" {
             if (feature_set == "HalfKAv2^")
                 return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
 
-            fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+            const std::string error = "Unknown feature_set " + std::string(feature_set_c);
+            set_creation_error(error.c_str());
+            fprintf(stderr, "%s\n", g_creation_error.data());
             return nullptr;
         }
         catch (const std::exception& error)
         {
+            set_creation_error(error.what());
             fprintf(stderr, "Failed to create sparse batch stream: %s\n", error.what());
             return nullptr;
         }
         catch (...)
         {
+            set_creation_error("unknown native loader error");
             fprintf(stderr, "Failed to create sparse batch stream: unknown error\n");
             return nullptr;
         }
@@ -887,7 +1036,28 @@ extern "C" {
     // the seeded entry point above; legacy callers retain their old behavior.
     EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping)
     {
-        return create_sparse_batch_stream_with_seed(feature_set_c, concurrency, filename, batch_size, cyclic, filtered, random_fen_skipping, std::random_device{}());
+        try
+        {
+            return create_sparse_batch_stream_with_seed(
+                feature_set_c,
+                concurrency,
+                filename,
+                batch_size,
+                cyclic,
+                filtered,
+                random_fen_skipping,
+                std::random_device{}());
+        }
+        catch (const std::exception& error)
+        {
+            set_creation_error(error.what());
+            return nullptr;
+        }
+        catch (...)
+        {
+            set_creation_error("unknown random-seed initialization error");
+            return nullptr;
+        }
     }
 
     EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)

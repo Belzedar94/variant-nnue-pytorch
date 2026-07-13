@@ -59,7 +59,7 @@ def require_single_device_trainer(trainer):
   world_size = int(trainer.world_size)
   if world_size != 1:
     raise ValueError(
-      'Legacy Atomic V1 training supports exactly one Lightning process/device; '
+      'Atomic native-stream training supports exactly one Lightning process/device; '
       'multi-device and multi-node strategies would duplicate the stateful native stream.'
     )
 
@@ -80,6 +80,9 @@ def validate_data_paths(train_filename, val_filename, allow_train_as_validation=
       'Training and validation must be separate files. '
       'Use --allow-train-as-validation only for an explicit smoke/debug run.'
     )
+
+  if not allow_train_as_validation:
+    nnue_dataset.validate_training_validation_data_paths(train_filename, val_filename)
 
 def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size, seed):
   features_name = feature_set.name
@@ -121,8 +124,8 @@ def load_or_create_model(feature_set, lambda_, seed, resume_from_model=None):
 
 def main():
   parser = argparse.ArgumentParser(description="Trains the network.")
-  parser.add_argument("train", help="Training data (.bin)")
-  parser.add_argument("val", help="Validation data (.bin)")
+  parser.add_argument("train", help="Training data (.bin or .atbin.manifest.json)")
+  parser.add_argument("val", help="Validation data (.bin or .atbin.manifest.json)")
   parser = pl.Trainer.add_argparse_args(parser)
   parser.add_argument("--lambda", default=1.0, type=lambda_argument, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--num-workers", default=1, type=positive_int32, dest='num_workers', help="Number of native worker threads to use for data loading.")
@@ -172,7 +175,19 @@ def main():
     batch_size = default_batch_size(main_device)
   print('Using batch size {}'.format(batch_size))
 
-  print('Smart fen skipping: {}'.format(not args.no_smart_fen_skipping))
+  smart_filter_requested = not args.no_smart_fen_skipping
+  v2_inputs = [
+    label for label, path in (('train', args.train), ('validation', args.val))
+    if os.fspath(path).lower().endswith('.atbin.manifest.json')
+  ]
+  if v2_inputs:
+    print(
+      'Smart fen skipping: {} for Legacy input; bypassed for Atomic BIN V2 {} '
+      '(authenticated generator policy)'.format(
+        smart_filter_requested,
+        ' and '.join(v2_inputs)))
+  else:
+    print('Smart fen skipping: {}'.format(smart_filter_requested))
   print('Random fen skipping: {}'.format(args.random_fen_skipping))
 
   print('Using c++ data loader')

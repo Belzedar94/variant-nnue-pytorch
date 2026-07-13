@@ -69,6 +69,28 @@ def test_same_training_and_validation_file_is_rejected(tmp_path):
     train.validate_data_paths(str(data), str(data), allow_train_as_validation=True)
 
 
+def test_distinct_paths_delegate_native_v2_overlap_check(tmp_path, monkeypatch):
+    training = tmp_path / 'train.atbin.manifest.json'
+    validation = tmp_path / 'validation.atbin.manifest.json'
+    training.write_text('{}')
+    validation.write_text('{}')
+    calls = []
+    monkeypatch.setattr(
+        train.nnue_dataset,
+        'validate_training_validation_data_paths',
+        lambda left, right: calls.append((left, right)))
+
+    train.validate_data_paths(str(training), str(validation))
+    assert calls == [(str(training), str(validation))]
+
+    calls.clear()
+    train.validate_data_paths(
+        str(training),
+        str(validation),
+        allow_train_as_validation=True)
+    assert calls == []
+
+
 def test_relative_absolute_and_hardlink_aliases_are_rejected(tmp_path, monkeypatch):
     data = tmp_path / 'data.bin'
     alias = tmp_path / 'alias.bin'

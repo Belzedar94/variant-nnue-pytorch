@@ -1,6 +1,8 @@
 import base64
 import hashlib
+import json
 import os
+import struct
 
 import pytest
 
@@ -40,3 +42,94 @@ def atomic_legacy_32(tmp_path):
     path = tmp_path / 'atomic-legacy-32.bin'
     path.write_bytes(data)
     return path
+
+
+@pytest.fixture
+def atomic_v2_manifest(tmp_path):
+    data_schema = '0352b036f2a140c609e3eb9c9d635dc553e8d77253d8faa92437390f5cf93cb6'
+    manifest_schema = '83d63922df3ac4a0c81a21ec9d9fd9e180efe50f26efee62fe01710e09da5b42'
+    record = bytes.fromhex(
+        '2453364211111111'
+        '00000000000000000000000000000000'
+        '777777778ab99ca8'
+        '000f07003f38ff00'
+        '0000010000000000'
+        '85ffffff0c0700002a000000ff000000'
+    )
+    header = struct.pack(
+        '<8sHHIII32sQ32s',
+        b'ATBINV2\0',
+        2,
+        96,
+        0x01020304,
+        64,
+        0,
+        bytes.fromhex(data_schema),
+        1,
+        bytes(32),
+    )
+    payload = header + record
+    root = tmp_path / 'atomic-v2-\N{LATIN SMALL LETTER N WITH TILDE}'
+    root.mkdir()
+    shard = root / 'datos-\N{LATIN SMALL LETTER N WITH TILDE}.atbin'
+    shard.write_bytes(payload)
+    manifest = {
+        'manifest_version': 1,
+        'manifest_schema_sha256': manifest_schema,
+        'data_schema_sha256': data_schema,
+        'format': 'atomic-bin-v2',
+        'engine': {
+            'commit': '1e64c6f16e8c327be6ee5e3de57ed54d1079f060',
+            'version': 'Atomic-Stockfish Python trainer fixture',
+        },
+        'network': {'file': 'atomic.nnue', 'sha256': '1' * 64},
+        'book': {'kind': 'builtin-startpos', 'file': None, 'sha256': None},
+        'generation': {
+            'resolved_seed': '20260713',
+            'atomic960': False,
+            'threads': 1,
+            'hash_mb': '16',
+            'use_nnue': 'pure',
+            'options': {
+                'search_depth_min': 3,
+                'search_depth_max': 3,
+                'nodes': '0',
+                'requested_records': '1',
+                'records_per_shard': '1',
+                'eval_limit': 32000,
+                'eval_diff_limit': 64000,
+                'random_move_min_ply': 1,
+                'random_move_max_ply': 24,
+                'random_move_count': 5,
+                'random_move_like_apery': 0,
+                'random_multi_pv': 5,
+                'random_multi_pv_diff': 100,
+                'random_multi_pv_depth': 3,
+                'write_min_ply': 5,
+                'write_max_ply': 400,
+                'keep_draws': '0.5',
+                'adjudicate_draws_by_score': False,
+                'adjudicate_insufficient': False,
+                'filter_captures': True,
+                'filter_checks': False,
+                'filter_promotions': True,
+                'random_file_name': False,
+                'set_recommended_uci_options_seen': True,
+            },
+        },
+        'statistics': {'records': '1', 'draws': '0'},
+        'shards': [{
+            'index': 0,
+            'file': shard.name,
+            'records': '1',
+            'bytes': str(len(payload)),
+            'sha256': hashlib.sha256(payload).hexdigest(),
+        }],
+    }
+    manifest_path = shard.with_name(shard.name + '.manifest.json')
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(',', ':')) + '\n',
+        encoding='utf-8',
+        newline='\n',
+    )
+    return manifest_path

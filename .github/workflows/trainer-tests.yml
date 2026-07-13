@@ -25,6 +25,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Fetch audited Atomic-Stockfish main ref
+        run: git -C external/Atomic-Stockfish fetch --no-tags origin main:refs/remotes/origin/main
 
       - uses: actions/setup-python@v5
         with:
@@ -56,6 +61,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Fetch audited Atomic-Stockfish main ref
+        run: git -C external/Atomic-Stockfish fetch --no-tags origin main:refs/remotes/origin/main
 
       - uses: actions/setup-python@v5
         with:

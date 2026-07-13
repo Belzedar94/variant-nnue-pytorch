@@ -1,0 +1,3 @@
+[submodule "external/Atomic-Stockfish"]
+	path = external/Atomic-Stockfish
+	url = https://github.com/Belzedar94/Atomic-Stockfish.git

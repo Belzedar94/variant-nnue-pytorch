@@ -2,9 +2,12 @@
 #define _SFEN_STREAM_H_
 
 #include "nnue_training_data_formats.h"
+#include "atomic_bin_v2_training_data.h"
 
 #include <optional>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <memory>
 
@@ -34,6 +37,11 @@ namespace training_data {
         {
             return filename + "." + ext;
         }
+    }
+
+    static bool is_atomic_bin_v2_manifest(const std::string& filename)
+    {
+        return ends_with(filename, ".atbin.manifest.json");
     }
 
     struct BasicSfenInputStream
@@ -131,10 +139,91 @@ namespace training_data {
         std::uint64_t m_record_index{0};
     };
 
+    struct AtomicBinV2InputStream : BasicSfenInputStream
+    {
+        AtomicBinV2InputStream(
+            const std::string& manifest_filename,
+            bool cyclic,
+            std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+            m_cyclic(cyclic),
+            m_skipPredicate(std::move(skipPredicate))
+        {
+            Stockfish::Data::DataResult opened =
+                Stockfish::Data::AtomicBinV2DatasetReader::open(
+                    std::filesystem::u8path(manifest_filename),
+                    m_reader);
+            if (!opened)
+                throw std::invalid_argument(
+                    "cannot open Atomic BIN V2 manifest: " + opened.message);
+
+            const auto& options = m_reader->manifest().options;
+            std::clog
+                << "Atomic BIN V2 manifest policy: eval_limit=" << options.evalLimit
+                << " filter_captures=" << (options.filterCaptures ? "true" : "false")
+                << " filter_promotions=" << (options.filterPromotions ? "true" : "false")
+                << " filter_checks=" << (options.filterChecks ? "true" : "false")
+                << '\n';
+        }
+
+        std::optional<TrainingDataEntry> next() override
+        {
+            bool rewound_once = false;
+            for (;;)
+            {
+                Stockfish::Data::AtomicBinV2DecodedRecord decoded{};
+                bool has_record = false;
+                Stockfish::Data::DataResult read = m_reader->next(decoded, has_record);
+                if (!read)
+                    throw std::invalid_argument(
+                        "invalid Atomic BIN V2 dataset: " + read.message);
+
+                if (has_record)
+                {
+                    TrainingDataEntry entry =
+                        atomic_bin_v2::to_training_data_entry(decoded);
+                    if (!m_skipPredicate || !m_skipPredicate(entry))
+                        return entry;
+                    continue;
+                }
+
+                if (m_cyclic && !rewound_once)
+                {
+                    Stockfish::Data::DataResult rewound = m_reader->rewind();
+                    if (!rewound)
+                        throw std::invalid_argument(
+                            "cannot rewind Atomic BIN V2 dataset: " + rewound.message);
+                    rewound_once = true;
+                    continue;
+                }
+
+                m_eof = true;
+                return std::nullopt;
+            }
+        }
+
+        bool eof() const override
+        {
+            return m_eof;
+        }
+
+    private:
+        std::unique_ptr<Stockfish::Data::AtomicBinV2DatasetReader> m_reader;
+        bool m_eof{false};
+        bool m_cyclic;
+        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+    };
+
     inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
     {
         if (has_extension(filename, BinSfenInputStream::extension))
             return std::make_unique<BinSfenInputStream>(filename, cyclic, std::move(skipPredicate));
+
+        if (is_atomic_bin_v2_manifest(filename))
+            return std::make_unique<AtomicBinV2InputStream>(filename, cyclic, std::move(skipPredicate));
+
+        if (has_extension(filename, "atbin"))
+            throw std::invalid_argument(
+                "Atomic BIN V2 raw shards are not dataset entrypoints; use the .atbin.manifest.json sidecar");
 
         return nullptr;
     }
@@ -142,10 +231,8 @@ namespace training_data {
     inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
     {
         // TODO (low priority): optimize and parallelize .bin reading.
-        if (has_extension(filename, BinSfenInputStream::extension))
-            return std::make_unique<BinSfenInputStream>(filename, cyclic, std::move(skipPredicate));
-
-        return nullptr;
+        (void) concurrency;
+        return open_sfen_input_file(filename, cyclic, std::move(skipPredicate));
     }
 }
 
