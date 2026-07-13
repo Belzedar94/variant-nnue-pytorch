@@ -40,7 +40,7 @@ compile_data_loader.bat
 
 Linux/Mac:
 ```
-sh compile_data_loader.bat
+sh compile_data_loader.sh
 ```
 
 # Tests
