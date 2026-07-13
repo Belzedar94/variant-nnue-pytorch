@@ -294,7 +294,8 @@ namespace chess
             m_pieces{},
             m_pocketCount{},
             m_pieceCount{},
-            m_kings{}
+            m_kings{},
+            m_walls{}
         {
             std::fill_n(m_pieces, static_cast<uint8_t>(Square::NB), Piece::None);
         }
@@ -341,6 +342,26 @@ namespace chess
             return m_pieces[static_cast<uint8_t>(sq)];
         }
 
+        void setWall(Square sq, bool value = true)
+        {
+            m_walls.set(static_cast<size_t>(sq), value);
+        }
+
+        [[nodiscard]] bool isWall(Square sq) const
+        {
+            return m_walls.test(static_cast<size_t>(sq));
+        }
+
+        [[nodiscard]] std::size_t wallCount() const
+        {
+            return m_walls.count();
+        }
+
+        const std::bitset<static_cast<size_t>(Square::NB)>& wallSquares() const
+        {
+            return m_walls;
+        }
+
         [[nodiscard]] inline Square kingSquare(Color c) const
         {
             return m_kings[static_cast<uint8_t>(c)];
@@ -358,6 +379,7 @@ namespace chess
         uint8_t m_pocketCount[(unsigned int)(Piece::NB)];
         uint8_t m_pieceCount;
         Square m_kings[(unsigned int)(Color::NB)];
+        std::bitset<static_cast<size_t>(Square::NB)> m_walls;
     };
 
 
@@ -749,7 +771,24 @@ namespace bin
                 }
             }
 
-            for (chess::Color c : { chess::Color::White, chess::Color::Black })
+            if constexpr (HAS_WALLS)
+            {
+                // Wall squares
+                for (chess::Rank r = chess::Rank::RANK_MAX; r >= chess::Rank::RANK_1; --r)
+                {
+                    for (chess::File f = chess::File::FILE_A; f <= chess::File::FILE_MAX; ++f)
+                    {
+                        auto sq = make_square(f, r);
+                        if (stream.read_one_bit())
+                        {
+                            if (pos.pieceAt(sq) == chess::Piece::None)
+                                pos.setWall(sq);
+                        }
+                    }
+                }
+            }
+
+            for (chess::Color c : { chess::Color::White, chess::Color::Black }) 
                 for (chess::PieceType pt = chess::PieceType::Pawn; pt <= chess::PieceType::MaxPiece; ++pt)
                 {
                     const int hand_count = stream.read_n_bit(DATA_SIZE > 512 ? 7 : 5);
