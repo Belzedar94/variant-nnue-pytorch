@@ -224,10 +224,22 @@ struct HalfKAv2 {
     static constexpr int NUM_KSQ = static_cast<int>(Square::KNB);
     static constexpr int NUM_SQ = static_cast<int>(Square::NB);
     static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2 - (NUM_KSQ > 1);
-    static constexpr int NUM_PLANES = NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - (NUM_KSQ > 1));
+    static constexpr bool USE_POTIONS = HAS_POTIONS;
+    static constexpr int COLOR_COUNT = static_cast<int>(Color::NB);
+    static constexpr int POTION_ZONE_PLANES = USE_POTIONS ? COLOR_COUNT * POTION_TYPE_NB : 0;
+    static constexpr int POTION_ZONE_FEATURES = POTION_ZONE_PLANES * NUM_SQ;
+    static constexpr int POTION_COOLDOWN_FEATURES =
+        USE_POTIONS ? COLOR_COUNT * POTION_TYPE_NB * POTION_COOLDOWN_BITS : 0;
+    static constexpr int NUM_PLANES_BASE =
+        NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - (NUM_KSQ > 1));
+    static constexpr int POTION_ZONE_OFFSET = NUM_PLANES_BASE;
+    static constexpr int POTION_COOLDOWN_OFFSET = POTION_ZONE_OFFSET + POTION_ZONE_FEATURES;
+    static constexpr int NUM_PLANES =
+        NUM_PLANES_BASE + POTION_ZONE_FEATURES + POTION_COOLDOWN_FEATURES;
     static constexpr int INPUTS = NUM_PLANES * NUM_KSQ;
 
-    static constexpr int MAX_ACTIVE_FEATURES = MAX_PIECES;
+    static constexpr int MAX_ACTIVE_FEATURES =
+        MAX_PIECES + POTION_ZONE_FEATURES + POTION_COOLDOWN_FEATURES;
 
     static int feature_index(Color color, Square ksq, Square sq, Piece p)
     {
@@ -241,6 +253,26 @@ struct HalfKAv2 {
     {
         auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
         return handCount + p_idx * MAX_HAND_PIECES + NUM_SQ * NUM_PT + map_king(ksq) * NUM_PLANES;
+    }
+
+    static int potion_zone_feature_index(Color perspective, Square ksq, Color potionColor,
+                                         int potionType, Square sq)
+    {
+        const int relativeColor = static_cast<int>(potionColor != perspective);
+        const int potionIndex = potionType + POTION_TYPE_NB * relativeColor;
+        return static_cast<int>(orient_flip(perspective, sq))
+               + POTION_ZONE_OFFSET + potionIndex * NUM_SQ
+               + map_king(ksq) * NUM_PLANES;
+    }
+
+    static int potion_cooldown_feature_index(Color perspective, Square ksq, Color potionColor,
+                                             int potionType, int bit)
+    {
+        const int relativeColor = static_cast<int>(potionColor != perspective);
+        const int potionIndex = potionType + POTION_TYPE_NB * relativeColor;
+        return bit + POTION_COOLDOWN_OFFSET
+               + potionIndex * POTION_COOLDOWN_BITS
+               + map_king(ksq) * NUM_PLANES;
     }
 
     static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
@@ -268,6 +300,32 @@ struct HalfKAv2 {
                     ++j;
                 }
 
+        if constexpr (USE_POTIONS)
+        {
+            for (Color c : { Color::White, Color::Black })
+                for (int pt = 0; pt < POTION_TYPE_NB; ++pt)
+                {
+                    const auto& zone = pos.potionZone(c, pt);
+                    for (Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+                    {
+                        if (!zone.test(static_cast<size_t>(sq)))
+                            continue;
+                        values[j] = 1.0f;
+                        features[j] = potion_zone_feature_index(color, orient_flip(color, ksq), c, pt, sq);
+                        ++j;
+                    }
+                    std::uint16_t cooldown = pos.potionCooldown(c, pt);
+                    for (int bit = 0; bit < POTION_COOLDOWN_BITS; ++bit)
+                    {
+                        if (!(cooldown & (1u << bit)))
+                            continue;
+                        values[j] = 1.0f;
+                        features[j] = potion_cooldown_feature_index(color, orient_flip(color, ksq), c, pt, bit);
+                        ++j;
+                    }
+                }
+        }
+
         return { j, INPUTS };
     }
 };
@@ -275,10 +333,16 @@ struct HalfKAv2 {
 struct HalfKAv2Factorized {
     // Factorized features
     static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2;
-    static constexpr int PIECE_INPUTS = HalfKAv2::NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - 2 * (HalfKAv2::NUM_KSQ > 1));
+    static constexpr int POTION_ZONE_OFFSET =
+        HalfKAv2::NUM_SQ * NUM_PT + MAX_HAND_PIECES * (NUM_PT - 2 * (HalfKAv2::NUM_KSQ > 1));
+    static constexpr int POTION_COOLDOWN_OFFSET =
+        POTION_ZONE_OFFSET + HalfKAv2::POTION_ZONE_FEATURES;
+    static constexpr int PIECE_INPUTS =
+        POTION_COOLDOWN_OFFSET + HalfKAv2::POTION_COOLDOWN_FEATURES;
     static constexpr int INPUTS = HalfKAv2::INPUTS + PIECE_INPUTS;
 
-    static constexpr int MAX_PIECE_FEATURES = MAX_PIECES;
+    static constexpr int MAX_PIECE_FEATURES =
+        MAX_PIECES + HalfKAv2::POTION_ZONE_FEATURES + HalfKAv2::POTION_COOLDOWN_FEATURES;
     static constexpr int MAX_ACTIVE_FEATURES = HalfKAv2::MAX_ACTIVE_FEATURES + MAX_PIECE_FEATURES;
 
     static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
@@ -307,6 +371,38 @@ struct HalfKAv2Factorized {
                     features[j] = offset + i + p_idx * MAX_HAND_PIECES + HalfKAv2::NUM_SQ * NUM_PT;
                     ++j;
                 }
+
+        if constexpr (HalfKAv2::USE_POTIONS)
+        {
+            for (Color c : { Color::White, Color::Black })
+                for (int pt = 0; pt < POTION_TYPE_NB; ++pt)
+                {
+                    const auto& zone = pos.potionZone(c, pt);
+                    for (Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+                    {
+                        if (!zone.test(static_cast<size_t>(sq)))
+                            continue;
+                        values[j] = 1.0f;
+                        const int potionIndex = pt + POTION_TYPE_NB * static_cast<int>(c != color);
+                        features[j] = offset + POTION_ZONE_OFFSET
+                                      + potionIndex * HalfKAv2::NUM_SQ
+                                      + static_cast<int>(orient_flip(color, sq));
+                        ++j;
+                    }
+                    std::uint16_t cooldown = pos.potionCooldown(c, pt);
+                    for (int bit = 0; bit < POTION_COOLDOWN_BITS; ++bit)
+                    {
+                        if (!(cooldown & (1u << bit)))
+                            continue;
+                        values[j] = 1.0f;
+                        const int potionIndex = pt + POTION_TYPE_NB * static_cast<int>(c != color);
+                        features[j] = offset + POTION_COOLDOWN_OFFSET
+                                      + potionIndex * POTION_COOLDOWN_BITS
+                                      + bit;
+                        ++j;
+                    }
+                }
+        }
 
         return { j, INPUTS };
     }
