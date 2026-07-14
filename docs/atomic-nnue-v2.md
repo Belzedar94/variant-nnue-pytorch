@@ -36,7 +36,18 @@ count and loss are persisted in the checkpoint and JSON summary.
 files. Both entrypoints reject implicit overwrites; neither accepts or silently
 upgrades a V1 network. The writer validates every physical tensor shape before
 emitting header bytes and is pinned to the engine's nonzero diagnostic fixture
-SHA-256 `2AF647392F7A30072C2DB29837C9175D22BA2DF450931762D0E2DE8CFE337B50`.
+SHA-256 `A14261B40D638B98257241C17DCC52DFCB5023B44F91D21C742F398183A4EA64`.
+That fixture diagnoses both main feature dimensions and PSQT buckets 0 through
+6, fixes FT biases in dimensions 2 and 514, and carries nonzero weights through
+every dense layer and both squared/linear activation paths. Bucket 7 remains
+zero; the complete integer reference ends at `fwd=18965` and controlled
+raw/public output `11112/694`.
+
+PSQT output follows the engine's signed integer contract: the perspective
+difference is divided by two with truncation toward zero. The training graph
+uses a straight-through estimator, so odd raw differences of `+1` and `-1`
+both produce zero rather than unrepresentable half-unit evaluations while
+retaining their gradient.
 
 The current strong V1 network remains appropriate as the generator's `pure`
 teacher. That does not make it a V2 initialization checkpoint.

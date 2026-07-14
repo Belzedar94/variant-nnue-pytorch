@@ -7,6 +7,7 @@ from atomic_v2.model import (
     SparseFeatureTransformer,
     pairwise_multiply,
 )
+from atomic_v2.quantization import PSQT_WEIGHT_SCALE, fake_quantize_psqt_output
 
 
 def test_sfnnv15_layer_stack_has_the_physical_v2_shapes():
@@ -107,3 +108,34 @@ def test_feature_transformer_quantizes_once_for_both_perspectives(monkeypatch):
 
     assert calls == [True]
     assert white.shape == black.shape == (1, 1032)
+
+
+def test_psqt_signed_halves_truncate_toward_zero_with_ste_gradient():
+    raw_halves = torch.tensor(
+        [[0.5], [-0.5], [1.0], [-1.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    output = fake_quantize_psqt_output(raw_halves / PSQT_WEIGHT_SCALE)
+
+    torch.testing.assert_close(
+        output * PSQT_WEIGHT_SCALE,
+        torch.tensor([[0.0], [0.0], [1.0], [-1.0]]),
+    )
+    output.sum().backward()
+    torch.testing.assert_close(
+        raw_halves.grad,
+        torch.full_like(raw_halves, 1.0 / PSQT_WEIGHT_SCALE),
+    )
+
+
+def test_psqt_float32_rounding_matches_cpp_for_signed_delta_sweep():
+    delta = torch.arange(-10_000, 10_001, dtype=torch.int64)
+    soft_half = delta.to(torch.float32) / PSQT_WEIGHT_SCALE * 0.5
+
+    output = fake_quantize_psqt_output(soft_half)
+    actual = torch.round(output * PSQT_WEIGHT_SCALE).to(torch.int64)
+    expected = torch.div(delta, 2, rounding_mode="trunc")
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -28,6 +28,7 @@ from .quantization import (
     clip_hidden_activation,
     fake_quantize_activation,
     fake_quantize_output,
+    fake_quantize_psqt_output,
     fake_quantize_weight,
 )
 
@@ -368,7 +369,9 @@ class AtomicNNUEV2(nn.Module):
         if fake_quantize_activations:
             transformed = fake_quantize_activation(transformed)
 
-        positional = (white_bucket - black_bucket) * (us - 0.5)
+        positional = fake_quantize_psqt_output(
+            (white_bucket - black_bucket) * (us - 0.5)
+        )
         return self.network(
             transformed,
             layer_stack_indices,

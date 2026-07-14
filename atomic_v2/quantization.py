@@ -48,3 +48,14 @@ def fake_quantize_output(value: torch.Tensor) -> torch.Tensor:
     quantized = torch.div(integer_value * multiplier, denominator, rounding_mode="trunc")
     hard = quantized.to(value.dtype) / float(multiplier)
     return hard.detach() + (value - value.detach())
+
+
+def fake_quantize_psqt_output(value: torch.Tensor) -> torch.Tensor:
+    """Match C++ signed integer PSQT division while preserving gradients."""
+
+    # Recover the pre-division integer. Truncating `value * 9600` directly is
+    # not stable in float32 (for example, -49 may be represented as -48.999996).
+    twice_raw = torch.round(value * (2.0 * PSQT_WEIGHT_SCALE)).to(torch.int64)
+    raw = torch.div(twice_raw, 2, rounding_mode="trunc")
+    hard = raw.to(value.dtype) / PSQT_WEIGHT_SCALE
+    return hard.detach() + (value - value.detach())
