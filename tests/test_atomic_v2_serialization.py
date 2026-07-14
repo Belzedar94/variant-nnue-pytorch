@@ -153,6 +153,13 @@ class _HashingSink:
         return len(data)
 
 
+def _stream_sha256(source):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 FT_PAIR_BIASES = (
     (2, 32, 32),
     (15, 16, 32),
@@ -421,7 +428,7 @@ def test_reader_imports_and_evaluates_the_engine_controlled_v2_fixture(tmp_path)
             "Atomic-Stockfish AtomicNNUEV2 controlled synthetic CI source",
         )
     with path.open("rb") as source:
-        assert hashlib.file_digest(source, "sha256").hexdigest().upper() == (
+        assert _stream_sha256(source).upper() == (
             "4DEB05CFF79B5D5EBA51C560F64ED24224671C188B6C5DB27521033E587C87C6"
         )
     assert path.stat().st_size == 46_780_619
