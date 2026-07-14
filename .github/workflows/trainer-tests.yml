@@ -29,7 +29,7 @@ jobs:
           submodules: recursive
 
       - name: Fetch audited Atomic-Stockfish main ref
-        run: git -C external/Atomic-Stockfish fetch --no-tags origin main:refs/remotes/origin/main
+        run: git -C external/Atomic-Stockfish fetch --no-tags --depth=2147483647 origin +refs/heads/main:refs/remotes/origin/main
 
       - uses: actions/setup-python@v5
         with:
@@ -65,7 +65,7 @@ jobs:
           submodules: recursive
 
       - name: Fetch audited Atomic-Stockfish main ref
-        run: git -C external/Atomic-Stockfish fetch --no-tags origin main:refs/remotes/origin/main
+        run: git -C external/Atomic-Stockfish fetch --no-tags --depth=2147483647 origin +refs/heads/main:refs/remotes/origin/main
 
       - uses: actions/setup-python@v5
         with:
