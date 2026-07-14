@@ -37,6 +37,8 @@ from atomic_v2.serialization import (
     write_header,
     write_nnue,
     _encode_numpy_signed_leb128,
+    _quantized_numpy,
+    _write_compressed_tensor,
 )
 
 
@@ -68,6 +70,23 @@ def test_vectorized_writer_codec_matches_the_scalar_reference(dtype):
     write_compressed_array(stream, values)
     stream.seek(0)
     np.testing.assert_array_equal(read_compressed_array(stream, values.size, dtype), values)
+
+
+@pytest.mark.parametrize("dtype", [np.dtype("i1"), np.dtype("<i2"), np.dtype("<i4")])
+def test_quantized_writers_accept_the_full_signed_dtype_range(dtype):
+    limits = np.iinfo(dtype)
+    tensor = torch.tensor([limits.min, limits.max], dtype=torch.float64)
+
+    array = _quantized_numpy(tensor, 1.0, dtype, "boundary")
+    assert array.tolist() == [limits.min, limits.max]
+
+    stream = io.BytesIO()
+    _write_compressed_tensor(stream, tensor, 1.0, dtype, chunk_elements=1)
+    stream.seek(0)
+    assert read_compressed_array(stream, 2, dtype).tolist() == [
+        limits.min,
+        limits.max,
+    ]
 
 
 def test_streaming_compressed_reader_rejects_noncanonical_values():

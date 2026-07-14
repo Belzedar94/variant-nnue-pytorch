@@ -309,7 +309,7 @@ def _write_compressed_tensor(
                 raise AtomicV2FormatError("network contains a non-finite parameter")
             minimum = int(rounded.min().item()) if rounded.numel() else 0
             maximum = int(rounded.max().item()) if rounded.numel() else 0
-            if minimum < -limits.max or maximum > limits.max:
+            if minimum < limits.min or maximum > limits.max:
                 raise AtomicV2FormatError(
                     f"quantized parameter range [{minimum}, {maximum}] exceeds {dtype.name}"
                 )
@@ -538,7 +538,7 @@ def _quantized_numpy(
     if rounded.numel():
         minimum = int(rounded.min().item())
         maximum = int(rounded.max().item())
-        if minimum < -limits.max or maximum > limits.max:
+        if minimum < limits.min or maximum > limits.max:
             raise AtomicV2FormatError(
                 f"{label} range [{minimum}, {maximum}] exceeds {dtype.name}"
             )
