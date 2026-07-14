@@ -260,6 +260,9 @@ class AtomicLayerStacks(nn.Module):
 
         fc0 = self.fc0(value, bucket_indices, fake_quantize_weights)
         short_skip = fc0[:, -2:-1] - fc0[:, -1:]
+        # Deliberately square the signed pre-activation before clipping. This
+        # is the exact SqrClippedReLU order used by the engine and the pinned
+        # official trainer; negative inputs therefore contribute on this path.
         fc0_squared = fc0.square()
         fc0_linear = fc0
         if fake_quantize_activations:

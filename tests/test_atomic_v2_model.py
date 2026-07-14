@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from atomic_v2.contract import FEATURE_DIMENSIONS, FEATURE_NAME
@@ -37,6 +38,32 @@ def test_sfnnv15_short_skip_is_fc0_minus_two_minus_minus_one():
     )
 
     torch.testing.assert_close(output, torch.full((3, 1), 2.0))
+
+
+@pytest.mark.parametrize(
+    "negative_layer,fc2_input",
+    [("fc0", 0), ("fc1", 64)],
+)
+def test_sqr_clipped_relu_squares_signed_fc_preactivations(
+    negative_layer, fc2_input
+):
+    stacks = AtomicLayerStacks()
+    with torch.no_grad():
+        for parameter in stacks.parameters():
+            parameter.zero_()
+        getattr(stacks, negative_layer).linear.bias[0] = -0.5
+        stacks.fc2.linear.weight[0, fc2_input] = 1.0
+
+    output = stacks(
+        torch.zeros((1, 1024), dtype=torch.float32),
+        torch.zeros(1, dtype=torch.long),
+        fake_quantize_activations=False,
+        fake_quantize_weights=False,
+    )
+
+    # Engine SqrClippedReLU and official nnue-pytorch both square first and
+    # clip second, so the squared branch receives (-0.5)^2 rather than zero.
+    torch.testing.assert_close(output, torch.tensor([[0.25]]))
 
 
 def test_pairwise_multiply_is_per_perspective_then_concatenated():
