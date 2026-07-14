@@ -15,3 +15,9 @@ def test_ci_fetches_complete_audited_engine_main_history():
 
     # Both CPU and trusted CUDA jobs must make the ancestry proof meaningful.
     assert workflow.count(command) == 2
+
+
+def test_authenticated_contract_bytes_are_lf_on_every_checkout():
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+
+    assert "atomic_v2/schema/*.json text eol=lf" in attributes
