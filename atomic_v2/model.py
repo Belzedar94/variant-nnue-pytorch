@@ -253,6 +253,8 @@ class AtomicLayerStacks(nn.Module):
     ) -> torch.Tensor:
         if value.ndim != 2 or value.shape[1] != 1024:
             raise ValueError("SFNNv15 layer stacks require [batch, 1024] input")
+        if bucket_indices.shape != (value.shape[0],):
+            raise ValueError("layer-stack indices must have shape [batch]")
         if bucket_indices.dtype != torch.long:
             raise TypeError("layer-stack indices must use torch.long")
         if torch.any((bucket_indices < 0) | (bucket_indices >= LAYER_STACKS)):
@@ -344,6 +346,11 @@ class AtomicNNUEV2(nn.Module):
     ) -> torch.Tensor:
         if us.ndim != 2 or us.shape[1] != 1 or them.shape != us.shape:
             raise ValueError("us and them must have shape [batch, 1]")
+        batch_size = us.shape[0]
+        if psqt_indices.shape != (batch_size,) or layer_stack_indices.shape != (
+            batch_size,
+        ):
+            raise ValueError("bucket indices must have shape [batch]")
         if psqt_indices.dtype != torch.long or layer_stack_indices.dtype != torch.long:
             raise TypeError("bucket indices must use torch.long")
         if torch.any((psqt_indices < 0) | (psqt_indices >= self.psqt_buckets)):

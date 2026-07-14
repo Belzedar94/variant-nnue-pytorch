@@ -66,6 +66,49 @@ def test_sqr_clipped_relu_squares_signed_fc_preactivations(
     torch.testing.assert_close(output, torch.tensor([[0.25]]))
 
 
+@pytest.mark.parametrize(
+    "bucket_indices",
+    [torch.zeros(1, dtype=torch.long), torch.zeros((2, 1), dtype=torch.long)],
+)
+def test_layer_stacks_reject_bucket_shapes_that_can_broadcast(bucket_indices):
+    stacks = AtomicLayerStacks()
+
+    with pytest.raises(ValueError, match=r"shape \[batch\]"):
+        stacks(torch.zeros((2, 1024)), bucket_indices)
+
+
+@pytest.mark.parametrize(
+    "psqt_indices,layer_stack_indices",
+    [
+        (torch.zeros(1, dtype=torch.long), torch.zeros(2, dtype=torch.long)),
+        (torch.zeros((2, 1), dtype=torch.long), torch.zeros(2, dtype=torch.long)),
+        (torch.zeros(2, dtype=torch.long), torch.zeros(1, dtype=torch.long)),
+        (torch.zeros(2, dtype=torch.long), torch.zeros((2, 1), dtype=torch.long)),
+    ],
+)
+def test_model_rejects_bucket_shapes_that_can_broadcast(
+    psqt_indices, layer_stack_indices
+):
+    model = AtomicNNUEV2.__new__(AtomicNNUEV2)
+    torch.nn.Module.__init__(model)
+    us = torch.ones((2, 1), dtype=torch.float32)
+    them = 1.0 - us
+    indices = torch.full((2, 1), -1, dtype=torch.int32)
+    values = torch.zeros((2, 1), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=r"shape \[batch\]"):
+        model(
+            us,
+            them,
+            indices,
+            values,
+            indices,
+            values,
+            psqt_indices,
+            layer_stack_indices,
+        )
+
+
 def test_pairwise_multiply_is_per_perspective_then_concatenated():
     x = torch.zeros((1, 2048), dtype=torch.float32)
     x[:, :512] = 2.0
