@@ -36,12 +36,13 @@ count and loss are persisted in the checkpoint and JSON summary.
 files. Both entrypoints reject implicit overwrites; neither accepts or silently
 upgrades a V1 network. The writer validates every physical tensor shape before
 emitting header bytes and is pinned to the engine's nonzero diagnostic fixture
-SHA-256 `A14261B40D638B98257241C17DCC52DFCB5023B44F91D21C742F398183A4EA64`.
+SHA-256 `4DEB05CFF79B5D5EBA51C560F64ED24224671C188B6C5DB27521033E587C87C6`.
 That fixture diagnoses both main feature dimensions and PSQT buckets 0 through
-6, fixes FT biases in dimensions 2 and 514, and carries nonzero weights through
-every dense layer and both squared/linear activation paths. Bucket 7 remains
-zero; the complete integer reference ends at `fwd=18965` and controlled
-raw/public output `11112/694`.
+6, activates ten paired FT dimensions across SIMD and sparse-group boundaries,
+and carries nonzero weights through every dense layer and both squared/linear
+activation paths. Its eight layer stacks have distinct raw/public outputs from
+`10587/661` through `11112/694`, detecting stack permutation or fixed-bucket
+errors. PSQT bucket 7 remains zero.
 
 PSQT output follows the engine's signed integer contract: the perspective
 difference is divided by two with truncation toward zero. The training graph

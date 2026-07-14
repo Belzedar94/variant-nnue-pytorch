@@ -153,9 +153,65 @@ class _HashingSink:
         return len(data)
 
 
-def _reference_dense_trace():
-    transformed = (32 * 32) // 512
-    fc0 = (8192 + 5 * transformed + 7 * transformed, 4096 + 11 * transformed + 13 * transformed)
+FT_PAIR_BIASES = (
+    (2, 32, 32),
+    (15, 16, 32),
+    (16, 32, 48),
+    (31, 48, 48),
+    (32, 48, 56),
+    (63, 56, 56),
+    (64, 60, 60),
+    (255, 20, 32),
+    (256, 32, 40),
+    (511, 32, 56),
+)
+FT_PAIR_INDICES = tuple(index for index, _first, _second in FT_PAIR_BIASES)
+FC0_CONNECTIONS = (
+    (0, 2, 5),
+    (0, 514, 7),
+    (1, 2, 11),
+    (1, 514, 13),
+) + tuple(
+    connection
+    for ordinal, index in enumerate(FT_PAIR_INDICES[1:], start=1)
+    for connection in (
+        (0, index, 1 + ordinal % 5),
+        (0, 512 + index, 6 + ordinal % 5),
+        (1, index, 2 + ordinal % 4),
+        (1, 512 + index, 7 + ordinal % 4),
+    )
+)
+
+
+def _transformed_inputs():
+    values = {}
+    for index, first, second in FT_PAIR_BIASES:
+        transformed = first * second // 512
+        values[index] = transformed
+        values[512 + index] = transformed
+    return values
+
+
+def _reference_dense_trace(bucket=7):
+    inputs = _transformed_inputs()
+    transformed = tuple(inputs[index] for index in FT_PAIR_INDICES)
+    fc0_biases = []
+    for output, target in enumerate((8216, 4144)):
+        contribution = sum(
+            value * inputs[input_index]
+            for candidate, input_index, value in FC0_CONNECTIONS
+            if candidate == output
+        )
+        fc0_biases.append(target - contribution)
+    fc0 = tuple(
+        fc0_biases[output]
+        + sum(
+            value * inputs[input_index]
+            for candidate, input_index, value in FC0_CONNECTIONS
+            if candidate == output
+        )
+        for output in range(2)
+    )
     sqr0 = tuple(value * value >> 21 for value in fc0)
     crelu0 = tuple(value >> 7 for value in fc0)
     fc1 = (
@@ -166,6 +222,7 @@ def _reference_dense_trace():
     crelu1 = tuple(value >> 6 for value in fc1)
     fc2 = (
         1024
+        + 128 * (bucket - 7)
         + sqr0[0]
         + 2 * sqr0[1]
         + 3 * crelu0[0]
@@ -205,8 +262,9 @@ def _controlled_wire_model():
     ).remainder(127) - 63
     weight[:, 1024:1031] = psqt.to(torch.float32) / PSQT_WEIGHT_SCALE
     bias = torch.zeros(1024, dtype=torch.float32)
-    bias[2] = 32.0 / FT_ONE
-    bias[514] = 32.0 / FT_ONE
+    for index, first, second in FT_PAIR_BIASES:
+        bias[index] = first / FT_ONE
+        bias[512 + index] = second / FT_ONE
     object.__setattr__(
         model,
         "feature_transformer",
@@ -221,15 +279,10 @@ def _controlled_wire_model():
             parameter.zero_()
         for bucket in range(8):
             fc0_row = bucket * 32
-            model.network.fc0.linear.bias[fc0_row] = 8192.0 / FC0_BIAS_SCALE
-            model.network.fc0.linear.bias[fc0_row + 1] = 4096.0 / FC0_BIAS_SCALE
+            model.network.fc0.linear.bias[fc0_row] = 7836.0 / FC0_BIAS_SCALE
+            model.network.fc0.linear.bias[fc0_row + 1] = 3718.0 / FC0_BIAS_SCALE
             model.network.fc0.linear.bias[fc0_row + 30] = 16384.0 / FC0_BIAS_SCALE
-            for output, input_index, value in (
-                (0, 2, 5),
-                (0, 514, 7),
-                (1, 2, 11),
-                (1, 514, 13),
-            ):
+            for output, input_index, value in FC0_CONNECTIONS:
                 model.network.fc0.linear.weight[fc0_row + output, input_index] = (
                     value / FC0_WEIGHT_SCALE
                 )
@@ -251,7 +304,9 @@ def _controlled_wire_model():
                     value / FC1_WEIGHT_SCALE
                 )
 
-            model.network.fc2.linear.bias[bucket] = 1024.0 / FC2_BIAS_SCALE
+            model.network.fc2.linear.bias[bucket] = (
+                1024.0 + 128.0 * (bucket - 7)
+            ) / FC2_BIAS_SCALE
             for input_index, value in (
                 (0, 1),
                 (1, 2),
@@ -269,7 +324,7 @@ def _controlled_wire_model():
 
 
 @torch.no_grad()
-def _model_dense_trace(model, indices, values):
+def _model_dense_trace(model, indices, values, bucket_index=7):
     white, black = model.feature_transformer.forward_pair(
         indices,
         values,
@@ -283,7 +338,7 @@ def _model_dense_trace(model, indices, values):
     transformed = fake_quantize_activation(
         pairwise_multiply(clip_feature_activation(side_ordered))
     )
-    bucket = torch.tensor([7], dtype=torch.long)
+    bucket = torch.tensor([bucket_index], dtype=torch.long)
 
     fc0 = model.network.fc0(transformed, bucket, True)
     activated0 = clip_hidden_activation(
@@ -313,7 +368,10 @@ def _model_dense_trace(model, indices, values):
         return tuple(int(round(float(value) * scale)) for value in tensor.reshape(-1))
 
     return {
-        "transformed": raw(transformed[:, 2], HIDDEN_ONE)[0],
+        "transformed": tuple(
+            raw(transformed[:, index], HIDDEN_ONE)[0]
+            for index in FT_PAIR_INDICES
+        ),
         "fc0": raw(fc0[:, :2], FC0_BIAS_SCALE),
         "sqr0": raw(activated0[:, :2], HIDDEN_ONE),
         "crelu0": raw(activated0[:, 32:34], HIDDEN_ONE),
@@ -364,7 +422,7 @@ def test_reader_imports_and_evaluates_the_engine_controlled_v2_fixture(tmp_path)
         )
     with path.open("rb") as source:
         assert hashlib.file_digest(source, "sha256").hexdigest().upper() == (
-            "A14261B40D638B98257241C17DCC52DFCB5023B44F91D21C742F398183A4EA64"
+            "4DEB05CFF79B5D5EBA51C560F64ED24224671C188B6C5DB27521033E587C87C6"
         )
     assert path.stat().st_size == 46_780_619
     del source_model
@@ -373,9 +431,10 @@ def test_reader_imports_and_evaluates_the_engine_controlled_v2_fixture(tmp_path)
     with path.open("rb") as source:
         model, description = read_nnue(source)
     assert description == "Atomic-Stockfish AtomicNNUEV2 controlled synthetic CI source"
-    assert torch.count_nonzero(model.feature_transformer.bias) == 2
-    assert model.feature_transformer.bias[2] * FT_ONE == 32
-    assert model.feature_transformer.bias[514] * FT_ONE == 32
+    assert torch.count_nonzero(model.feature_transformer.bias) == 20
+    for index, first, second in FT_PAIR_BIASES:
+        assert model.feature_transformer.bias[index] * FT_ONE == first
+        assert model.feature_transformer.bias[512 + index] * FT_ONE == second
     expected_psqt = torch.tensor(
         [
             [-63, -46, -29, -12, 5, 22, 39, 0],
@@ -394,7 +453,7 @@ def test_reader_imports_and_evaluates_the_engine_controlled_v2_fixture(tmp_path)
     indices = torch.tensor([[0, -1]], dtype=torch.int32)
     values = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
     expected_trace = {
-        "transformed": 2,
+        "transformed": (2, 1, 3, 4, 5, 6, 7, 1, 2, 3),
         "fc0": (8216, 4144),
         "sqr0": (32, 8),
         "crelu0": (64, 32),
@@ -405,21 +464,48 @@ def test_reader_imports_and_evaluates_the_engine_controlled_v2_fixture(tmp_path)
         "fwd": 18965,
         "raw": 11112,
     }
-    assert _reference_dense_trace() == expected_trace
-    assert _model_dense_trace(model, indices, values) == expected_trace
+    traces = tuple(_reference_dense_trace(bucket) for bucket in range(8))
+    assert traces[-1] == expected_trace
+    assert _model_dense_trace(model, indices, values, 7) == expected_trace
+    assert tuple(trace["raw"] for trace in traces) == (
+        10587,
+        10662,
+        10737,
+        10812,
+        10887,
+        10962,
+        11037,
+        11112,
+    )
     with torch.no_grad():
         output = model(
-            us,
-            1.0 - us,
-            indices,
-            values,
-            indices,
-            values,
-            torch.tensor([7], dtype=torch.long),
-            torch.tensor([7], dtype=torch.long),
+            us.repeat(8, 1),
+            (1.0 - us).repeat(8, 1),
+            indices.repeat(8, 1),
+            values.repeat(8, 1),
+            indices.repeat(8, 1),
+            values.repeat(8, 1),
+            torch.full((8,), 7, dtype=torch.long),
+            torch.arange(8, dtype=torch.long),
         )
-    torch.testing.assert_close(output, torch.tensor([[11112.0 / PSQT_WEIGHT_SCALE]]))
-    assert int(round(output.item() * PSQT_WEIGHT_SCALE)) // 16 == 694
+    raw_by_bucket = torch.tensor(
+        [10587, 10662, 10737, 10812, 10887, 10962, 11037, 11112],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(
+        output,
+        (raw_by_bucket / PSQT_WEIGHT_SCALE).reshape(-1, 1),
+    )
+    assert tuple((raw_by_bucket.to(torch.int64) // 16).tolist()) == (
+        661,
+        666,
+        671,
+        675,
+        680,
+        685,
+        689,
+        694,
+    )
 
     with torch.no_grad():
         diagnostic_output = model(
@@ -440,7 +526,7 @@ def test_reader_imports_and_evaluates_the_engine_controlled_v2_fixture(tmp_path)
     reexport = _HashingSink()
     write_nnue(reexport, model, description)
     assert reexport.digest.hexdigest().upper() == (
-        "A14261B40D638B98257241C17DCC52DFCB5023B44F91D21C742F398183A4EA64"
+        "4DEB05CFF79B5D5EBA51C560F64ED24224671C188B6C5DB27521033E587C87C6"
     )
     del model
     gc.collect()
