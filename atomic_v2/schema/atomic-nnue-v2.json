@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "schema_id": "atomic-nnue-dual-backend-v1",
+  "variant": "atomic",
+  "byte_order": "little-endian",
+  "backends": {
+    "legacy-atomic-v1": {
+      "file_version": "0x7AF32F20",
+      "feature_set": "HalfKAv2Atomic",
+      "feature_dimensions": 45056,
+      "accumulator_dimensions_per_perspective": 512,
+      "feature_transformer_output_dimensions": 1024,
+      "feature_transformer_hash_xor": 1024,
+      "feature_set_hash": "0x5F234CB8",
+      "feature_transformer_hash": "0x5F2348B8",
+      "architecture_hash": "0x633376CA",
+      "network_hash": "0x3C103E72",
+      "psqt_buckets": 8,
+      "layer_stacks": 8,
+      "topology": {
+        "fc0": {
+          "input_dimensions": 1024,
+          "output_dimensions": 16
+        },
+        "fc1": {
+          "input_dimensions": 16,
+          "output_dimensions": 32
+        },
+        "fc2": {
+          "input_dimensions": 32,
+          "output_dimensions": 1
+        },
+        "activation_paths": {
+          "after_fc0": [
+            "clipped-relu"
+          ],
+          "after_fc1": [
+            "clipped-relu"
+          ]
+        }
+      }
+    },
+    "atomic-nnue-v2": {
+      "file_version": "0xA70C0002",
+      "feature_set": "HalfKAv2Atomic",
+      "feature_dimensions": 45056,
+      "accumulator_dimensions_per_perspective": 1024,
+      "feature_transformer_output_dimensions": 1024,
+      "feature_transformer_hash_xor": 2048,
+      "feature_set_hash": "0x5F234CB8",
+      "feature_transformer_hash": "0x5F2344B8",
+      "architecture_hash": "0x63337116",
+      "network_hash": "0x3C1035AE",
+      "psqt_buckets": 8,
+      "layer_stacks": 8,
+      "pairwise_multiply": {
+        "input_dimensions_per_perspective": 1024,
+        "half_dimensions": 512,
+        "output_dimensions_per_perspective": 512,
+        "concatenated_output_dimensions": 1024
+      },
+      "topology": {
+        "fc0": {
+          "input_dimensions": 1024,
+          "output_dimensions": 32
+        },
+        "fc1": {
+          "input_dimensions": 64,
+          "output_dimensions": 32
+        },
+        "fc2": {
+          "input_dimensions": 128,
+          "output_dimensions": 1
+        },
+        "activation_paths": {
+          "after_fc0": [
+            "squared-clipped-relu",
+            "clipped-relu"
+          ],
+          "after_fc1": [
+            "squared-clipped-relu",
+            "clipped-relu"
+          ]
+        },
+        "fc0_skip_indices": [
+          30,
+          31
+        ],
+        "fc0_skip_coefficients": [
+          1,
+          -1
+        ],
+        "output_scaling": {
+          "hidden_one": 128,
+          "weight_scale_bits": 6,
+          "output_scale": 16,
+          "network_unit_scale": 600,
+          "multiplier": 9600,
+          "denominator": 16384
+        }
+      }
+    }
+  }
+}
