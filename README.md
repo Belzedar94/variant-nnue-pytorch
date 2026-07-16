@@ -76,13 +76,14 @@ python train.py train.atbin.manifest.json val.atbin.manifest.json
 See [docs/atomic-bin-v2.md](docs/atomic-bin-v2.md) for the pinned reader,
 schema and generator-policy contract.
 
-The isolated AtomicNNUEV3 bootstrap executor is currently dry-run-only until
-its audited native provider is injected. Its four frozen configurations,
-historical Ranger schedule and rolling checkpoint contract are documented in
+The isolated AtomicNNUEV3 bootstrap executor has an authenticated production
+CLI backed by the native provider and strict V3 serializer. Its four frozen
+configurations, historical Ranger schedule, shared seed-42 initialization,
+rolling checkpoint contract and final artifact receipts are documented in
 [docs/atomic-nnue-v3-bootstrap-executor.md](docs/atomic-nnue-v3-bootstrap-executor.md).
 The normative execution API first calls `prepare_production_run`; direct
 construction of a model/provider is not accepted by `run_production`. One
-`create_shared_initial_state()` result can be loaded by all four lambda runs.
+atomically persisted shared initial state is loaded by all four lambda runs.
 
 ## License of the native loader
 

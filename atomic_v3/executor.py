@@ -535,17 +535,23 @@ def prepare_production_run(
     model.to(torch.device(device))
     optimizer, scheduler = create_production_optimizer(model)
 
-    training_provider = training_provider_factory()
-    training_start = validate_provider_canary(
-        training_provider, role="train", config=config
-    )
-    validation_probe = validation_provider_factory()
+    training_provider: Optional[ResumableBatchProvider] = None
+    validation_probe: Optional[ResumableBatchProvider] = None
     try:
+        training_provider = training_provider_factory()
+        training_start = validate_provider_canary(
+            training_provider, role="train", config=config
+        )
+        validation_probe = validation_provider_factory()
         validation_start = validate_provider_canary(
             validation_probe, role="validation", config=config
         )
-    finally:
+    except BaseException:
         _close_provider(validation_probe)
+        _close_provider(training_provider)
+        raise
+    _close_provider(validation_probe)
+    assert training_provider is not None
     return PreparedProductionRun(
         config=config,
         model=model,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
@@ -22,6 +23,7 @@ from .dataset import (
     PerspectiveBatch,
     SparseSliceBatch,
 )
+from .executor import ProviderBatch
 
 
 ABI_VERSION = 1
@@ -121,6 +123,7 @@ if ctypes.sizeof(ProviderCursorV1) != 88:
 
 
 _BOUND_LIBRARY = None
+_BOUND_LIBRARY_PATH: Optional[str] = None
 
 
 def _decode_error(value: Optional[bytes], fallback: str) -> str:
@@ -129,15 +132,44 @@ def _decode_error(value: Optional[bytes], fallback: str) -> str:
     return value.decode("utf-8", errors="replace")
 
 
-def _bind_library():
-    global _BOUND_LIBRARY
-    if _BOUND_LIBRARY is not None:
-        return _BOUND_LIBRARY
-    # Reuse the loader selected by the legacy binding so one process cannot
-    # silently load two different native builds from the repository root.
-    import nnue_dataset
+def _bind_library(library_path: Optional[object] = None):
+    """Load and bind exactly one audited native provider library.
 
-    library = nnue_dataset.dll
+    Production always supplies an absolute path.  The no-argument legacy path
+    remains for existing library consumers and tests, but a process may never
+    switch the provider ABI to a different shared object after the first bind.
+    """
+
+    global _BOUND_LIBRARY, _BOUND_LIBRARY_PATH
+    requested_path: Optional[str]
+    if library_path is None:
+        requested_path = None
+    else:
+        requested = Path(os.path.abspath(os.fspath(library_path)))
+        if not requested.is_file():
+            raise FileNotFoundError(f"Atomic V3 provider library is not a file: {requested}")
+        requested_path = os.path.normcase(os.fspath(requested))
+    if _BOUND_LIBRARY is not None:
+        if requested_path is not None and requested_path != _BOUND_LIBRARY_PATH:
+            raise RuntimeError(
+                "a different Atomic V3 provider library is already loaded in this process"
+            )
+        return _BOUND_LIBRARY
+    if requested_path is None:
+        # Reuse the loader selected by the legacy binding so one process cannot
+        # silently load two different native builds from the repository root.
+        import nnue_dataset
+
+        library = nnue_dataset.dll
+        loaded_path = getattr(nnue_dataset, "dllpath", None)
+        _BOUND_LIBRARY_PATH = (
+            os.path.normcase(os.path.abspath(os.fspath(loaded_path)))
+            if loaded_path is not None
+            else None
+        )
+    else:
+        library = ctypes.CDLL(requested_path)
+        _BOUND_LIBRARY_PATH = requested_path
     library.atomic_v3_provider_abi_version.argtypes = []
     library.atomic_v3_provider_abi_version.restype = ctypes.c_uint32
     library.atomic_v3_provider_creation_error.argtypes = []
@@ -303,6 +335,7 @@ class NativeAtomicV3Provider:
         native_workers: int = 1,
         cyclic: Optional[bool] = None,
         device: object = "cpu",
+        library_path: Optional[object] = None,
         resume_state: Optional[Mapping[str, Any]] = None,
         **provenance: Any,
     ) -> None:
@@ -339,11 +372,19 @@ class NativeAtomicV3Provider:
         self._manifest_records = tuple(manifest_records)
         self._manifest_payloads = tuple(manifest_payloads)
         self.provenance = dict(provenance)
-        self._library = _bind_library()
+        self.library_path = (
+            os.path.abspath(os.fspath(library_path))
+            if library_path is not None
+            else None
+        )
+        self._library = _bind_library(self.library_path)
         self._stream = ctypes.c_void_p()
-        self._create_stream(resume_state)
+        self._stream = self._new_stream(resume_state)
+        self._initial_cursor = self.logical_cursor_state()
 
-    def _create_stream(self, resume_state: Optional[Mapping[str, Any]]) -> None:
+    def _new_stream(
+        self, resume_state: Optional[Mapping[str, Any]]
+    ) -> ctypes.c_void_p:
         path_bytes = [os.fsencode(path) for path in self._manifests]
         hash_bytes = [value.encode("ascii") for value in self._manifest_sha256]
         payload_buffers = [
@@ -394,11 +435,31 @@ class NativeAtomicV3Provider:
                 self._library.atomic_v3_provider_creation_error(),
                 "native Atomic V3 provider creation failed",
             )
+            if output.value:
+                self._library.atomic_v3_provider_destroy(output)
             raise NativeProviderError(message)
-        self._stream = output
+        return output
 
     def __iter__(self):
         return self
+
+    def next_batch(self, maximum_samples: int):
+        """Return one executor-owned batch without committing its cursor.
+
+        The native stream is configured for a fixed physical microbatch.  A
+        production request that differs from it cannot be honored without
+        creating a second cursor interpretation, so it fails before fetching.
+        Validation may return a smaller final batch only at native EOF; the
+        production executor independently requires exact full batches.
+        """
+
+        maximum = _plain_int("maximum_samples", maximum_samples, 1, 1 << 20)
+        if maximum != self.batch_size:
+            raise ValueError(
+                f"maximum_samples must equal configured batch_size {self.batch_size}"
+            )
+        payload = next(self)
+        return ProviderBatch(payload=payload, samples=payload.batch_size)
 
     def __next__(self) -> AtomicV3Batch:
         if not self._stream.value:
@@ -457,13 +518,47 @@ class NativeAtomicV3Provider:
             raise NativeProviderError("cannot read Atomic V3 committed cursor")
         return _cursor_state(cursor)
 
+    def logical_cursor_state(self) -> dict[str, Any]:
+        """Return the last committed logical cursor in the executor protocol."""
+
+        return self.state_dict()
+
+    def restore_logical_cursor(self, state: Mapping[str, Any]) -> None:
+        """Transactionally replace the stream with one restored at ``state``.
+
+        The old stream remains live until native creation and exact cursor
+        verification both succeed.  Consequently a rejected or malformed
+        checkpoint cannot leak a replacement stream or destroy the caller's
+        usable cursor.
+        """
+
+        if not self._stream.value:
+            raise RuntimeError("Atomic V3 provider is closed")
+        requested = _cursor_from_state(state)
+        if requested is None:
+            raise TypeError("logical cursor state must be a mapping")
+        expected = _cursor_state(requested)
+        replacement = self._new_stream(state)
+        old_stream = self._stream
+        try:
+            self._stream = replacement
+            actual = self.logical_cursor_state()
+            if actual != expected:
+                raise NativeProviderError(
+                    "native Atomic V3 provider restored a different logical cursor"
+                )
+        except BaseException:
+            self._stream = old_stream
+            self._library.atomic_v3_provider_destroy(replacement)
+            raise
+        self._library.atomic_v3_provider_destroy(old_stream)
+
     def reset_validation(self) -> None:
         """Reset validation to its fixed seed and initial non-cyclic cursor."""
 
         if self.role != "validation":
             raise RuntimeError("training provider must continue across epochs and cannot reset")
-        self.close()
-        self._create_stream(None)
+        self.restore_logical_cursor(self._initial_cursor)
 
     def close(self) -> None:
         if getattr(self, "_stream", None) is not None and self._stream.value:

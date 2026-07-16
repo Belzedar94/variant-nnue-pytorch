@@ -7,6 +7,7 @@ import torch
 
 from atomic_v3.contract import BACKEND_KEY
 from atomic_v3.dataset import validate_batch
+from atomic_v3.executor import ProviderBatch, ResumableBatchProvider
 from atomic_v3.native_provider import NativeAtomicV3Provider, NativeProviderError
 
 
@@ -265,3 +266,41 @@ def test_role_defaults_preserve_historical_skip_policy(atomic_v2_manifest):
     training = NativeAtomicV3Provider(**{**base, "role": "train"})
     assert training.random_fen_skipping == 3
     training.close()
+
+
+def test_native_provider_satisfies_resumable_executor_protocol(atomic_v2_manifest):
+    provider = NativeAtomicV3Provider(**_arguments(atomic_v2_manifest))
+    assert isinstance(provider, ResumableBatchProvider)
+    initial = provider.logical_cursor_state()
+    delivered = provider.next_batch(provider.batch_size)
+    assert isinstance(delivered, ProviderBatch)
+    assert delivered.samples == delivered.payload.batch_size == 1
+    assert provider.logical_cursor_state() == initial
+    provider.commit()
+    assert provider.logical_cursor_state()["accepted_samples"] == 1
+    provider.restore_logical_cursor(initial)
+    assert provider.logical_cursor_state() == initial
+    provider.close()
+
+
+def test_restore_is_transactional_when_native_rejects_cursor(atomic_v2_manifest):
+    provider = NativeAtomicV3Provider(**_arguments(atomic_v2_manifest))
+    initial = provider.logical_cursor_state()
+    forged = dict(initial)
+    forged["binding_sha256"] = "f" * 64
+    with pytest.raises(NativeProviderError, match="binding"):
+        provider.restore_logical_cursor(forged)
+    # The original stream was neither destroyed nor advanced by the rejected
+    # replacement, and therefore remains usable.
+    assert provider.logical_cursor_state() == initial
+    assert provider.next_batch(provider.batch_size).samples == 1
+    provider.close()
+
+
+def test_executor_batch_request_mismatch_does_not_fetch(atomic_v2_manifest):
+    provider = NativeAtomicV3Provider(**_arguments(atomic_v2_manifest))
+    initial = provider.logical_cursor_state()
+    with pytest.raises(ValueError, match="configured batch_size"):
+        provider.next_batch(provider.batch_size - 1)
+    assert provider.logical_cursor_state() == initial
+    provider.close()
