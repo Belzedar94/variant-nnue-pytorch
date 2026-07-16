@@ -58,6 +58,48 @@ def _snapshot(tmp_path):
     )
 
 
+def _completed_checkpoint_state(run_id, completed_epochs=executor_module.EPOCHS):
+    config = production.production_config(run_id)
+    counters = TrainingCounters(
+        completed_epochs=completed_epochs,
+        global_steps=completed_epochs * executor_module.TRAINING_STEPS_PER_EPOCH,
+        training_samples=(
+            completed_epochs * executor_module.TRAINING_SAMPLES_PER_EPOCH
+        ),
+        validation_samples=(
+            completed_epochs * executor_module.VALIDATION_SAMPLES_PER_EPOCH
+        ),
+        validation_batches=(
+            completed_epochs * executor_module.VALIDATION_BATCHES_PER_EPOCH
+        ),
+        last_epoch_training_samples=(
+            executor_module.TRAINING_SAMPLES_PER_EPOCH if completed_epochs else 0
+        ),
+        last_epoch_validation_samples=(
+            executor_module.VALIDATION_SAMPLES_PER_EPOCH if completed_epochs else 0
+        ),
+        last_epoch_validation_batches=(
+            executor_module.VALIDATION_BATCHES_PER_EPOCH if completed_epochs else 0
+        ),
+        last_train_loss=0.125 if completed_epochs else None,
+        last_validation_loss=0.25 if completed_epochs else None,
+        last_lambda=(
+            config.lambda_schedule.value(completed_epochs - 1)
+            if completed_epochs
+            else None
+        ),
+    )
+    cursor = {
+        "accepted_samples": counters.training_samples,
+        "next_batch_sequence": (
+            completed_epochs
+            * executor_module.TRAINING_STEPS_PER_EPOCH
+            * executor_module.ACCUMULATION_STEPS
+        ),
+    }
+    return counters, cursor
+
+
 def test_shared_initial_state_is_atomic_persistent_and_hash_checked(tmp_path, monkeypatch):
     calls = []
 
@@ -103,6 +145,7 @@ def test_one_run_calls_only_prepare_run_and_final_serializer(tmp_path, monkeypat
     }
     events = []
     provider = _CloseProbe()
+    completed_counters, completed_cursor = _completed_checkpoint_state("lambda-0")
 
     class Prepared:
         model = object()
@@ -120,7 +163,7 @@ def test_one_run_calls_only_prepare_run_and_final_serializer(tmp_path, monkeypat
             ("run", prepared, binding, output_directory, resume, progress_callback)
         )
         Path(output_directory, "last.ckpt").write_bytes(b"checkpoint")
-        return TrainingCounters(completed_epochs=37)
+        return completed_counters
 
     def serialize(path, model, description):
         events.append(("serialize", path, model, description))
@@ -167,6 +210,22 @@ def test_one_run_calls_only_prepare_run_and_final_serializer(tmp_path, monkeypat
     )
     assert status["status"] == "completed"
 
+    events.clear()
+    with pytest.raises(FileExistsError, match="final training receipt"):
+        production.execute_one_run(
+            run_id="lambda-0",
+            snapshot=snapshot,
+            output_root=tmp_path / "output",
+            provider_library=provider_library,
+            provider_sha256=production.sha256_file(provider_library),
+            trainer_commit=TRAINER_COMMIT,
+            shared=shared,
+            shared_artifact=shared_artifact,
+            device="cuda:0",
+            resume=False,
+        )
+    assert events == []
+
     def check(stream):
         payload = stream.read()
         return WireMetadata(
@@ -176,6 +235,16 @@ def test_one_run_calls_only_prepare_run_and_final_serializer(tmp_path, monkeypat
         )
 
     monkeypatch.setattr(production, "check_nnue", check)
+    authenticated = []
+
+    def load_checkpoint(output_directory, binding):
+        authenticated.append((Path(output_directory), binding))
+        return {
+            "counters": completed_counters.to_document(),
+            "logical_cursor": completed_cursor,
+        }
+
+    monkeypatch.setattr(production, "load_last_checkpoint", load_checkpoint)
     events.clear()
     resumed = production.execute_one_run(
         run_id="lambda-0",
@@ -190,7 +259,68 @@ def test_one_run_calls_only_prepare_run_and_final_serializer(tmp_path, monkeypat
         resume=True,
     )
     assert resumed == result
-    assert events == []  # no prepare, trainer, or serializer on verified completion
+    assert [event[0] for event in events] == ["prepare"]
+    assert len(authenticated) == 1
+    assert authenticated[0][0] == tmp_path / "output" / "runs" / "lambda-0"
+    assert authenticated[0][1].config_document() == {"normative": True}
+    assert authenticated[0][1].commits.trainer_commit == TRAINER_COMMIT
+    assert not any(event[0] in {"run", "serialize"} for event in events)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("incompatible-checkpoint", "incomplete-checkpoint", "receipt-counters"),
+)
+def test_completed_checkpoint_authentication_fails_closed(
+    tmp_path, monkeypatch, failure
+):
+    snapshot = _snapshot(tmp_path)
+    binding = production.CheckpointBinding(
+        config={"normative": True},
+        dataset=production.DatasetBinding.from_bootstrap(snapshot),
+        commits=production.CommitBinding(TRAINER_COMMIT),
+    )
+    completed_counters, completed_cursor = _completed_checkpoint_state("lambda-0")
+    receipt = {
+        "status": "completed",
+        "completed_epoch": executor_module.EPOCHS,
+        "engine_commit": binding.commits.engine_commit,
+        "bootstrap_verifier_commit": binding.commits.bootstrap_verifier_commit,
+        "config": binding.config_document(),
+        "counters": completed_counters.to_document(),
+    }
+
+    if failure == "incompatible-checkpoint":
+
+        def load_checkpoint(*args, **kwargs):
+            raise ValueError("checkpoint config is incompatible with this run")
+
+    else:
+        checkpoint_counters = completed_counters
+        checkpoint_cursor = completed_cursor
+        if failure == "incomplete-checkpoint":
+            checkpoint_counters, checkpoint_cursor = _completed_checkpoint_state(
+                "lambda-0", executor_module.EPOCHS - 1
+            )
+        elif failure == "receipt-counters":
+            receipt_counters = dict(completed_counters.to_document())
+            receipt_counters["global_steps"] -= 1
+            receipt["counters"] = receipt_counters
+
+        def load_checkpoint(*args, **kwargs):
+            return {
+                "counters": checkpoint_counters.to_document(),
+                "logical_cursor": checkpoint_cursor,
+            }
+
+    monkeypatch.setattr(production, "load_last_checkpoint", load_checkpoint)
+    with pytest.raises(production.ProductionLaunchError):
+        production._authenticate_completed_checkpoint(
+            tmp_path,
+            binding=binding,
+            config=production.production_config("lambda-0"),
+            receipt=receipt,
+        )
 
 
 def test_failed_run_closes_provider_and_writes_machine_status(tmp_path, monkeypatch):

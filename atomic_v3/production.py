@@ -27,17 +27,20 @@ from .checkpoint import (
     DatasetBinding,
     TrainingCounters,
     checkpoint_sha256,
+    load_last_checkpoint,
 )
 from .executor import (
     EPOCHS,
     MICROBATCH_SIZE,
     RUN_CONFIGS,
     PreparedProductionRun,
+    ProductionRunConfig,
     SharedInitialState,
     create_shared_initial_state,
     prepare_production_run,
     production_config,
     run_production,
+    validate_production_counters,
 )
 from .native_provider import NativeAtomicV3Provider
 from .serialization import WireMetadata, check_nnue, save_nnue
@@ -361,6 +364,10 @@ def _verify_completed_receipt(
         raise ProductionLaunchError("existing final receipt is unreadable") from error
     if not isinstance(document, dict) or document.get("format") != FINAL_RECEIPT_FORMAT:
         raise ProductionLaunchError("existing final receipt identity differs")
+    if document.get("status") != "completed":
+        raise ProductionLaunchError("existing final receipt status differs")
+    if document.get("completed_epoch") != EPOCHS:
+        raise ProductionLaunchError("existing final receipt completed epoch differs")
     expected = {
         "run_id": run_id,
         "bootstrap_receipt_sha256": snapshot.receipt_sha256,
@@ -413,6 +420,43 @@ def _verify_completed_receipt(
     return document
 
 
+def _authenticate_completed_checkpoint(
+    run_directory: Path,
+    *,
+    binding: CheckpointBinding,
+    config: ProductionRunConfig,
+    receipt: Mapping[str, object],
+) -> TrainingCounters:
+    """Authenticate an allegedly completed checkpoint against its exact run."""
+
+    try:
+        document = load_last_checkpoint(run_directory, binding)
+        counters = TrainingCounters.from_document(document["counters"])
+        validate_production_counters(config, counters, document["logical_cursor"])
+    except Exception as error:
+        raise ProductionLaunchError(
+            "existing final checkpoint is invalid or incompatible"
+        ) from error
+
+    if counters.completed_epochs != EPOCHS:
+        raise ProductionLaunchError("existing final checkpoint is not epoch 37")
+
+    expected_receipt_fields: dict[str, object] = {
+        "status": "completed",
+        "completed_epoch": EPOCHS,
+        "engine_commit": binding.commits.engine_commit,
+        "bootstrap_verifier_commit": binding.commits.bootstrap_verifier_commit,
+        "config": binding.config_document(),
+        "counters": counters.to_document(),
+    }
+    for field, expected in expected_receipt_fields.items():
+        if receipt.get(field) != expected:
+            raise ProductionLaunchError(
+                f"existing final receipt {field} differs from checkpoint"
+            )
+    return counters
+
+
 def cleanup_prepared(prepared: Optional[PreparedProductionRun]) -> None:
     """Release native provider and CUDA allocations before the next run."""
 
@@ -453,10 +497,11 @@ def execute_one_run(
     run_directory, network_path, receipt_path = _artifact_paths(output_root, run_id)
     run_directory.mkdir(parents=True, exist_ok=True)
     checkpoint_path = run_directory / "last.ckpt"
+    verified_receipt: Optional[dict[str, object]] = None
     if receipt_path.exists():
         if not resume:
             raise FileExistsError(f"final training receipt already exists: {receipt_path}")
-        verified = _verify_completed_receipt(
+        verified_receipt = _verify_completed_receipt(
             receipt_path,
             run_id=run_id,
             snapshot=snapshot,
@@ -464,12 +509,7 @@ def execute_one_run(
             provider_sha256=provider_sha256,
             trainer_commit=trainer_commit,
         )
-        _write_status(
-            run_directory,
-            {"status": "already-complete", "run_id": run_id, "receipt": os.fspath(receipt_path)},
-        )
-        return verified
-    if network_path.exists():
+    elif network_path.exists():
         raise FileExistsError(
             f"orphan final network exists without its receipt: {network_path}"
         )
@@ -515,6 +555,22 @@ def execute_one_run(
             dataset=DatasetBinding.from_bootstrap(snapshot),
             commits=CommitBinding(trainer_commit),
         )
+        if verified_receipt is not None:
+            _authenticate_completed_checkpoint(
+                run_directory,
+                binding=binding,
+                config=config,
+                receipt=verified_receipt,
+            )
+            _write_status(
+                run_directory,
+                {
+                    "status": "already-complete",
+                    "run_id": run_id,
+                    "receipt": os.fspath(receipt_path),
+                },
+            )
+            return verified_receipt
         progress = _ProgressReporter(run_directory, run_id)
         _write_status(
             run_directory,
