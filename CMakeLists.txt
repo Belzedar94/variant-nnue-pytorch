@@ -115,6 +115,11 @@ add_library(atomic_bin_v2_reader_core STATIC
   ${ATOMIC_STOCKFISH_ROOT}/src/data/sha256.cpp
   ${ATOMIC_STOCKFISH_ROOT}/src/data/atomic_bin_v2_manifest.cpp
   ${ATOMIC_STOCKFISH_ROOT}/src/data/atomic_bin_v2_reader.cpp
+  ${ATOMIC_STOCKFISH_ROOT}/src/nnue/atomic_v3/hm_oracle.cpp
+  ${ATOMIC_STOCKFISH_ROOT}/src/nnue/atomic_v3/capture_pair.cpp
+  ${ATOMIC_STOCKFISH_ROOT}/src/nnue/atomic_v3/king_blast_ep.cpp
+  ${ATOMIC_STOCKFISH_ROOT}/src/nnue/atomic_v3/blast_ring.cpp
+  ${ATOMIC_STOCKFISH_ROOT}/src/nnue/atomic_v3/full_refresh.cpp
   lib/atomic_stockfish_tt_stub.cpp)
 set_target_properties(atomic_bin_v2_reader_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(atomic_bin_v2_reader_core PUBLIC
@@ -124,7 +129,9 @@ target_compile_definitions(atomic_bin_v2_reader_core PRIVATE NNUE_EMBEDDING_OFF)
 add_library(dataset_file_identity STATIC lib/dataset_file_identity.cpp)
 set_target_properties(dataset_file_identity PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(training_data_loader SHARED training_data_loader.cpp)
+add_library(training_data_loader SHARED
+  training_data_loader.cpp
+  lib/atomic_v3_provider.cpp)
 
 if(MSVC)
   target_compile_options(training_data_loader PRIVATE
@@ -150,7 +157,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-  add_executable(training_data_loader_tests tests/native_loader_tests.cpp)
+  add_executable(training_data_loader_tests
+    tests/native_loader_tests.cpp
+    lib/atomic_v3_provider.cpp)
   target_link_libraries(training_data_loader_tests PRIVATE
     atomic_bin_v2_reader_core
     dataset_file_identity

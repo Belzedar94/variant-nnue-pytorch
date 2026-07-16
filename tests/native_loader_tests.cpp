@@ -8,16 +8,20 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "../training_data_loader.cpp"
+#include "../lib/atomic_v3_provider.h"
 #include "../external/Atomic-Stockfish/src/atomic_init.h"
 #include "../external/Atomic-Stockfish/src/data/sha256.h"
+#include "../external/Atomic-Stockfish/src/nnue/atomic_v3/full_refresh.h"
 
 using bin::TrainingDataEntry;
 using namespace chess;
 namespace AtomicData = Stockfish::Data;
+namespace AtomicV3 = Stockfish::Eval::NNUE::AtomicV3;
 
 struct TemporaryDirectory
 {
@@ -949,6 +953,362 @@ static void test_corrupt_full_size_records_fail_closed()
     }
 }
 
+static AtomicData::TrainingDataSample v3_sample(
+    const std::string& fen,
+    Stockfish::Move move,
+    std::int32_t score,
+    int result)
+{
+    AtomicData::TrainingDataSample sample;
+    sample.fen = fen;
+    sample.move = move;
+    sample.score = score;
+    sample.ply = 17;
+    sample.result = result;
+    return sample;
+}
+
+static std::string read_binary_file(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    assert(input);
+    const auto end = input.tellg();
+    assert(end > 0);
+    input.seekg(0);
+    std::string bytes(static_cast<std::size_t>(end), '\0');
+    input.read(bytes.data(), end);
+    assert(input);
+    return bytes;
+}
+
+struct V3ProviderInputs
+{
+    std::vector<std::string> paths;
+    std::vector<std::string> payloads;
+    std::vector<std::string> hashes;
+    std::vector<std::uint64_t> records;
+    std::vector<AtomicV3ManifestInputV1> descriptors;
+
+    explicit V3ProviderInputs(const std::vector<const V2Dataset*>& datasets)
+    {
+        paths.reserve(datasets.size());
+        payloads.reserve(datasets.size());
+        hashes.reserve(datasets.size());
+        records.reserve(datasets.size());
+        descriptors.reserve(datasets.size());
+        for (const auto* dataset : datasets)
+        {
+            paths.push_back(utf8_path(dataset->manifest));
+            payloads.push_back(read_binary_file(dataset->manifest));
+            AtomicData::Sha256 digest;
+            digest.update(payloads.back());
+            hashes.push_back(digest.hex_digest());
+            records.push_back(dataset->metadata.records);
+        }
+        for (std::size_t index = 0; index < datasets.size(); ++index)
+            descriptors.push_back({
+                paths[index].data(), paths[index].size(),
+                reinterpret_cast<const std::uint8_t*>(payloads[index].data()),
+                payloads[index].size(), hashes[index].data(), hashes[index].size(), records[index]});
+    }
+
+    AtomicV3ProviderConfigV1 config(
+        std::uint32_t batchSize,
+        std::uint32_t skipping,
+        bool cyclic,
+        const AtomicV3ProviderCursorV1* resume = nullptr) const
+    {
+        AtomicV3ProviderConfigV1 value{};
+        value.abiVersion = AtomicV3ProviderAbiVersion;
+        value.structSize = sizeof(value);
+        value.manifests = descriptors.data();
+        value.manifestCount = static_cast<std::uint32_t>(descriptors.size());
+        value.batchSize = batchSize;
+        value.randomFenSkipping = skipping;
+        value.nativeWorkers = 1;
+        value.seed = 20260716;
+        value.cyclic = cyclic ? 1 : 0;
+        value.resumeCursor = resume;
+        return value;
+    }
+};
+
+static AtomicV3ProviderStreamV1* create_v3_provider(const AtomicV3ProviderConfigV1& config)
+{
+    AtomicV3ProviderStreamV1* stream = nullptr;
+    assert(atomic_v3_provider_create(&config, &stream) == ATOMIC_V3_PROVIDER_OK);
+    assert(stream != nullptr);
+    return stream;
+}
+
+static AtomicV3BatchViewV1 fetch_v3_batch(
+    AtomicV3ProviderStreamV1* stream,
+    AtomicV3ProviderBatchV1*& batch)
+{
+    batch = nullptr;
+    assert(atomic_v3_provider_fetch(stream, &batch) == ATOMIC_V3_PROVIDER_OK);
+    assert(batch != nullptr);
+    AtomicV3BatchViewV1 view{};
+    assert(atomic_v3_provider_batch_view(batch, &view) == ATOMIC_V3_PROVIDER_OK);
+    assert(view.abiVersion == AtomicV3ProviderAbiVersion);
+    assert(view.structSize == sizeof(view));
+    return view;
+}
+
+static Stockfish::Piece v3_piece_from_wire(Stockfish::u8 value)
+{
+    switch (value)
+    {
+    case AtomicData::ATOMIC_BIN_V2_EMPTY: return Stockfish::NO_PIECE;
+    case AtomicData::ATOMIC_BIN_V2_WHITE_PAWN: return Stockfish::W_PAWN;
+    case AtomicData::ATOMIC_BIN_V2_WHITE_KNIGHT: return Stockfish::W_KNIGHT;
+    case AtomicData::ATOMIC_BIN_V2_WHITE_BISHOP: return Stockfish::W_BISHOP;
+    case AtomicData::ATOMIC_BIN_V2_WHITE_ROOK: return Stockfish::W_ROOK;
+    case AtomicData::ATOMIC_BIN_V2_WHITE_QUEEN: return Stockfish::W_QUEEN;
+    case AtomicData::ATOMIC_BIN_V2_WHITE_KING: return Stockfish::W_KING;
+    case AtomicData::ATOMIC_BIN_V2_BLACK_PAWN: return Stockfish::B_PAWN;
+    case AtomicData::ATOMIC_BIN_V2_BLACK_KNIGHT: return Stockfish::B_KNIGHT;
+    case AtomicData::ATOMIC_BIN_V2_BLACK_BISHOP: return Stockfish::B_BISHOP;
+    case AtomicData::ATOMIC_BIN_V2_BLACK_ROOK: return Stockfish::B_ROOK;
+    case AtomicData::ATOMIC_BIN_V2_BLACK_QUEEN: return Stockfish::B_QUEEN;
+    case AtomicData::ATOMIC_BIN_V2_BLACK_KING: return Stockfish::B_KING;
+    default: assert(false); return Stockfish::NO_PIECE;
+    }
+}
+
+static AtomicV3::CapturePairSnapshot v3_snapshot(
+    const AtomicData::AtomicBinV2DecodedRecord& record)
+{
+    AtomicV3::CapturePairSnapshot snapshot{};
+    snapshot.sideToMove = record.fields.position.sideToMove == AtomicData::ATOMIC_BIN_V2_WHITE_TO_MOVE
+        ? Stockfish::WHITE : Stockfish::BLACK;
+    snapshot.epSquare = record.fields.position.enPassantSquare == AtomicData::AtomicBinV2NoSquare
+        ? Stockfish::SQ_NONE : Stockfish::Square(record.fields.position.enPassantSquare);
+    for (std::size_t square = 0; square < snapshot.board.size(); ++square)
+        snapshot.board[square] = v3_piece_from_wire(record.fields.position.board[square]);
+    return snapshot;
+}
+
+template<typename ExpectedIndex>
+static void assert_v3_sparse_row(
+    const AtomicV3SparseSliceViewV1& row,
+    const ExpectedIndex& expected,
+    std::uint32_t count)
+{
+    assert(row.width >= count);
+    for (std::uint32_t index = 0; index < count; ++index)
+    {
+        assert(row.indices[index] == static_cast<std::int32_t>(expected(index)));
+        assert(row.values[index] == 1.0F);
+    }
+    for (std::uint32_t index = count; index < row.width; ++index)
+    {
+        assert(row.indices[index] == -1);
+        assert(row.values[index] == 0.0F);
+    }
+}
+
+static void assert_v3_oracle_parity(
+    const AtomicV3PerspectiveViewV1& view,
+    const AtomicV3::FullRefreshEmission& emission)
+{
+    assert(view.ownKingSquares[0] == static_cast<std::int64_t>(emission.hm.orientation.ownKing));
+    assert_v3_sparse_row(view.hm,
+        [&](std::uint32_t index) { return emission.hm.features[index].trainingIndex; },
+        emission.hm.size);
+    assert_v3_sparse_row(view.capturePair,
+        [&](std::uint32_t index) { return emission.capturePairs.features[index].localIndex; },
+        emission.capturePairs.size);
+    assert_v3_sparse_row(view.kingBlastEp,
+        [&](std::uint32_t index) { return emission.kingBlastEp.features[index].localIndex; },
+        emission.kingBlastEp.size);
+    assert_v3_sparse_row(view.blastRing,
+        [&](std::uint32_t index) { return emission.blastRing.features[index].localIndex; },
+        emission.blastRing.size);
+}
+
+static std::set<std::filesystem::path> v3_snapshot_names()
+{
+    std::set<std::filesystem::path> names;
+    std::error_code error;
+    const auto directory = std::filesystem::temp_directory_path(error);
+    if (error)
+        return names;
+    for (std::filesystem::directory_iterator iterator(directory, error), end;
+         !error && iterator != end; iterator.increment(error))
+    {
+        const auto name = iterator->path().filename().string();
+        if (name.rfind("atomic-bin-v2-reader-", 0) == 0 && iterator->path().extension() == ".tmp")
+            names.insert(iterator->path());
+    }
+    return names;
+}
+
+static void test_atomic_v3_provider_validation_boundaries_and_oracle()
+{
+    Stockfish::initialize_atomic_core();
+    TemporaryDirectory temporary("v3-validation");
+    const auto firstSample = v3_sample(
+        "7k/3p4/8/2N1p3/3P4/8/8/K7 w - - 0 1",
+        Stockfish::Move(Stockfish::SQ_C5, Stockfish::SQ_D7), 123, -1);
+    const auto secondSample = v3_sample(
+        "7k/3p4/8/2N1p3/3P4/8/8/K7 b - - 0 1",
+        Stockfish::Move(Stockfish::SQ_E5, Stockfish::SQ_D4), -456, 1);
+    const auto first = create_v2_dataset(temporary.path, "v3-first", firstSample);
+    const auto second = create_v2_dataset(temporary.path, "v3-second", secondSample);
+    const V3ProviderInputs inputs({&first, &second});
+    const auto config = inputs.config(3, 0, false);
+    auto* stream = create_v3_provider(config);
+
+    AtomicV3ProviderCursorV1 initial{};
+    assert(atomic_v3_provider_committed_cursor(stream, &initial) == ATOMIC_V3_PROVIDER_OK);
+    assert(initial.epoch == 0 && initial.manifestIndex == 0 && initial.recordIndex == 0);
+
+    AtomicV3ProviderBatchV1* batch = nullptr;
+    const auto view = fetch_v3_batch(stream, batch);
+    assert(view.size == 2);
+    assert(view.score[0] == 123.0F && view.score[1] == -456.0F);
+    assert(view.outcome[0] == 0.0F && view.outcome[1] == 1.0F);
+    assert(view.sideToMoveWhite[0] == 1.0F && view.sideToMoveWhite[1] == 0.0F);
+    assert(view.cursorAfter.eof == 1 && view.cursorAfter.manifestIndex == 2);
+
+    std::unique_ptr<AtomicData::AtomicBinV2DatasetReader> reader;
+    assert(AtomicData::AtomicBinV2DatasetReader::open(first.manifest, reader));
+    AtomicData::AtomicBinV2DecodedRecord decoded{};
+    bool hasRecord = false;
+    assert(reader->next(decoded, hasRecord) && hasRecord);
+    const auto snapshot = v3_snapshot(decoded);
+    AtomicV3::FullRefreshEmission white{};
+    AtomicV3::FullRefreshEmission black{};
+    assert(AtomicV3::emit_full_refresh(snapshot, Stockfish::WHITE, white)
+        == AtomicV3::CapturePairError::None);
+    assert(AtomicV3::emit_full_refresh(snapshot, Stockfish::BLACK, black)
+        == AtomicV3::CapturePairError::None);
+    assert_v3_oracle_parity(view.white, white);
+    assert_v3_oracle_parity(view.black, black);
+    assert(view.pieceCounts[0] == white.hm.size);
+    assert(view.bucketIndices[0] == white.hm.networkBucket);
+
+    AtomicV3ProviderCursorV1 beforeCommit{};
+    assert(atomic_v3_provider_committed_cursor(stream, &beforeCommit) == ATOMIC_V3_PROVIDER_OK);
+    assert(beforeCommit.manifestIndex == 0 && beforeCommit.eof == 0);
+    assert(atomic_v3_provider_commit(stream) == ATOMIC_V3_PROVIDER_OK);
+    AtomicV3ProviderCursorV1 committed{};
+    assert(atomic_v3_provider_committed_cursor(stream, &committed) == ATOMIC_V3_PROVIDER_OK);
+    assert(committed.eof == 1 && committed.acceptedSamples == 2
+        && committed.nextBatchSequence == 1);
+    atomic_v3_provider_destroy_batch(batch);
+    batch = nullptr;
+    assert(atomic_v3_provider_fetch(stream, &batch) == ATOMIC_V3_PROVIDER_EOF);
+    atomic_v3_provider_destroy(stream);
+
+    const auto resumeConfig = inputs.config(3, 0, false, &committed);
+    auto* resumed = create_v3_provider(resumeConfig);
+    assert(atomic_v3_provider_fetch(resumed, &batch) == ATOMIC_V3_PROVIDER_EOF);
+    atomic_v3_provider_destroy(resumed);
+}
+
+static void test_atomic_v3_provider_cyclic_cursor_and_exact_resume()
+{
+    TemporaryDirectory temporary("v3-resume");
+    const auto first = create_v2_dataset(temporary.path, "v3-a", v3_sample(
+        "7k/8/8/8/8/8/4P3/K7 w - - 0 1",
+        Stockfish::Move(Stockfish::SQ_E2, Stockfish::SQ_E3), 101, -1));
+    const auto second = create_v2_dataset(temporary.path, "v3-b", v3_sample(
+        "7k/4p3/8/8/8/8/8/K7 b - - 0 1",
+        Stockfish::Move(Stockfish::SQ_E7, Stockfish::SQ_E6), 202, 1));
+    const V3ProviderInputs inputs({&first, &second});
+    auto* stream = create_v3_provider(inputs.config(3, 0, true));
+    AtomicV3ProviderBatchV1* firstBatch = nullptr;
+    auto firstView = fetch_v3_batch(stream, firstBatch);
+    assert(firstView.size == 3);
+    assert(firstView.score[0] == 101.0F && firstView.score[1] == 202.0F
+        && firstView.score[2] == 101.0F);
+    assert(firstView.cursorAfter.epoch == 1 && firstView.cursorAfter.manifestIndex == 1);
+    assert(atomic_v3_provider_commit(stream) == ATOMIC_V3_PROVIDER_OK);
+    AtomicV3ProviderCursorV1 committed{};
+    assert(atomic_v3_provider_committed_cursor(stream, &committed) == ATOMIC_V3_PROVIDER_OK);
+    atomic_v3_provider_destroy_batch(firstBatch);
+
+    AtomicV3ProviderBatchV1* uncommittedBatch = nullptr;
+    auto uncommittedView = fetch_v3_batch(stream, uncommittedBatch);
+    const std::vector<float> expected(
+        uncommittedView.score, uncommittedView.score + uncommittedView.size);
+    AtomicV3ProviderCursorV1 stillCommitted{};
+    assert(atomic_v3_provider_committed_cursor(stream, &stillCommitted) == ATOMIC_V3_PROVIDER_OK);
+    assert(stillCommitted.epoch == committed.epoch
+        && stillCommitted.manifestIndex == committed.manifestIndex
+        && stillCommitted.recordIndex == committed.recordIndex
+        && stillCommitted.acceptedSamples == committed.acceptedSamples);
+    atomic_v3_provider_destroy_batch(uncommittedBatch);
+    atomic_v3_provider_destroy(stream);
+
+    auto* resumed = create_v3_provider(inputs.config(3, 0, true, &committed));
+    AtomicV3ProviderBatchV1* resumedBatch = nullptr;
+    const auto resumedView = fetch_v3_batch(resumed, resumedBatch);
+    assert(std::vector<float>(resumedView.score, resumedView.score + resumedView.size) == expected);
+    atomic_v3_provider_destroy_batch(resumedBatch);
+    atomic_v3_provider_destroy(resumed);
+}
+
+static void test_atomic_v3_provider_manifest_tamper_and_snapshot_cleanup()
+{
+    const auto before = v3_snapshot_names();
+    TemporaryDirectory temporary("v3-cleanup");
+    std::vector<AtomicData::TrainingDataSample> samples;
+    for (int index = 0; index < 4; ++index)
+        samples.push_back(v3_sample(
+            "7k/8/8/8/8/8/4P3/K7 w - - 0 1",
+            Stockfish::Move(Stockfish::SQ_E2, Stockfish::SQ_E3), 10 + index, index % 3 - 1));
+    const auto multi = create_v2_multishard_dataset(
+        temporary.path, "v3-multi", {{samples.begin(), samples.begin() + 3}, {samples.back()}});
+
+    // Use a one-record descriptor helper for creation-time manifest tamper.
+    const auto one = create_v2_dataset(temporary.path, "v3-one", samples.front());
+    V3ProviderInputs tamperedInputs({&one});
+    {
+        std::ofstream output(one.manifest, std::ios::binary | std::ios::app);
+        output.put(' ');
+    }
+    AtomicV3ProviderStreamV1* rejected = nullptr;
+    const auto tamperedConfig = tamperedInputs.config(1, 0, false);
+    assert(atomic_v3_provider_create(&tamperedConfig, &rejected) == ATOMIC_V3_PROVIDER_ERROR);
+    assert(rejected == nullptr);
+    assert(std::string(atomic_v3_provider_creation_error()).find("changed") != std::string::npos);
+
+    // Build the equivalent descriptor directly for the multi-shard manifest.
+    V2Dataset multiAdapter;
+    multiAdapter.manifest = multi.manifest;
+    multiAdapter.shard = multi.shards.front();
+    multiAdapter.metadata = multi.metadata;
+    const V3ProviderInputs validInputs({&multiAdapter});
+    auto* stream = create_v3_provider(validInputs.config(1, 0, false));
+    AtomicV3ProviderBatchV1* batch = nullptr;
+    (void) fetch_v3_batch(stream, batch); // Leaves the first authenticated shard snapshot live.
+    atomic_v3_provider_destroy_batch(batch);
+    atomic_v3_provider_destroy(stream);
+    assert(v3_snapshot_names() == before);
+
+    auto* corruptStream = create_v3_provider(validInputs.config(1, 0, false));
+    {
+        std::fstream shard(multi.shards.front(), std::ios::binary | std::ios::in | std::ios::out);
+        assert(shard);
+        shard.seekg(-1, std::ios::end);
+        char value = 0;
+        shard.read(&value, 1);
+        shard.clear();
+        shard.seekp(-1, std::ios::end);
+        shard.put(static_cast<char>(value ^ 1));
+    }
+    batch = nullptr;
+    assert(atomic_v3_provider_fetch(corruptStream, &batch) == ATOMIC_V3_PROVIDER_ERROR);
+    assert(batch == nullptr);
+    assert(std::string(atomic_v3_provider_error(corruptStream)).find("SHA-256")
+        != std::string::npos);
+    atomic_v3_provider_destroy(corruptStream);
+    assert(v3_snapshot_names() == before);
+}
+
 int main()
 {
     static_assert(sizeof(bin::nodchip::PackedSfenValue) == 72, "legacy ABI must stay 72 bytes");
@@ -966,5 +1326,8 @@ int main()
     test_atomic_bin_v2_corruption_and_schema_fail_closed();
     test_atomic_bin_v2_train_validation_overlap();
     test_corrupt_full_size_records_fail_closed();
+    test_atomic_v3_provider_validation_boundaries_and_oracle();
+    test_atomic_v3_provider_cyclic_cursor_and_exact_resume();
+    test_atomic_v3_provider_manifest_tamper_and_snapshot_cleanup();
     return 0;
 }
