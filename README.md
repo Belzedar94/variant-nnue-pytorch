@@ -76,6 +76,11 @@ python train.py train.atbin.manifest.json val.atbin.manifest.json
 See [docs/atomic-bin-v2.md](docs/atomic-bin-v2.md) for the pinned reader,
 schema and generator-policy contract.
 
+The isolated AtomicNNUEV3 bootstrap executor is currently dry-run-only until
+its audited native provider is injected. Its four frozen configurations,
+historical Ranger schedule and rolling checkpoint contract are documented in
+[docs/atomic-nnue-v3-bootstrap-executor.md](docs/atomic-nnue-v3-bootstrap-executor.md).
+
 ## License of the native loader
 
 `training_data_loader` statically links selected source files from

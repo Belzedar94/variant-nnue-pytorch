@@ -154,6 +154,14 @@ opposite-sign edge pairs, then runs an Atomic V3 forward/backward and controlled
 optimizer step. Setting `ATOMIC_REQUIRE_CUDA_TESTS=1` makes a missing CUDA/CuPy
 runtime a session error rather than a skip.
 
+## Bootstrap execution contract
+
+H9.3l-k Slice2 adds the strict four-run Ranger/StepLR executor, exact
+microbatch accumulation and rolling atomic checkpoint/resume seam. See
+[`atomic-nnue-v3-bootstrap-executor.md`](atomic-nnue-v3-bootstrap-executor.md)
+for the frozen parameters and dry-run command. This does not weaken the
+bootstrap receipt's non-publication scope.
+
 ## Deliberate milestone limits
 
 H9.3l-j proves indexing, factorization, mixed feature forward, loss and a finite
@@ -165,7 +173,7 @@ just to run the CPU healthcheck. The caller's thread count and deterministic
 algorithm mode, including PyTorch's independent `warn_only` flag, are restored
 as well. It is not the production schedule.
 
-Checkpoint/network serialization, final dependency/environment binding,
-controlled execution evidence and the first real training run belong to
-H9.3l-k and later milestones. Nothing in this backend claims training
-publication readiness.
+The rolling training checkpoint is now implemented, but final network
+serialization, the audited native provider, controlled execution evidence and
+the first real training run remain later milestones. Nothing in this backend
+claims training publication readiness.
