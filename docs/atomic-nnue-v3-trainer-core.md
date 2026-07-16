@@ -38,6 +38,13 @@ the explicit `provider_factory`. A prior `CampaignInspectionSnapshot` is for
 display and diagnostics only and cannot be passed as authority. There is no
 loader auto-detection or legacy fallback.
 
+Each authenticated read freezes one absolute lexical provenance label before
+opening the descriptor and returns that label together with the descriptor
+identity and immutable bytes. No `resolve()` occurs after authentication, so a
+post-read symlink swap cannot redirect the reported campaign parent or manifest
+discovery into another tree. Labels remain non-authoritative; consumers use the
+authenticated manifest bytes and hashes.
+
 The factory receives the fresh immutable manifest bytes as `manifest_payloads`,
 together with paths, expected hashes and record counts. A native adapter MUST
 parse those supplied bytes rather than reopen a manifest as unauthenticated
@@ -69,19 +76,30 @@ immediately after the update. Mixed i16/i8 tables, the inward float32-safe PSQT
 i32 envelope, all dense signed-i32 biases and both HM/FC0 factor sums are
 therefore exportable at every persistent step boundary. FC0 bias and weight
 limits apply to the serialized base+factor value, not just to each training
-factor independently. FC0 biases are coalesced and saturated in float64, written
-back as coordinated float32 operands, and then checked using both float32 and
-float64 addition before control returns. This prevents both the `+2147483648`
-float32 half-ulp overflow and the `-2147483776` value exposed only by float64
-coalescing. No signed-i32 cast is attempted before the range check, and
-non-finite dense biases fail closed.
+factor independently. FC0 biases and factorized HM PSQT weights are coalesced
+and saturated in float64, written back as coordinated float32 operands, and
+then checked using the real wire rounding from both float32 and float64 addition
+before control returns. This prevents both the FC0 `+2147483648` float32
+half-ulp overflow / `-2147483776` float64 overflow and the analogous HM PSQT
+opposite-sign cancellation at the 9,600 scale. No signed-i32 cast is attempted
+before the range check, and non-finite dense biases or factorized i32 sums fail
+closed.
+
+The opt-in `cuda-required` CI job exercises this same clamp on CUDA with both
+opposite-sign edge pairs, then runs an Atomic V3 forward/backward and controlled
+optimizer step. Setting `ATOMIC_REQUIRE_CUDA_TESTS=1` makes a missing CUDA/CuPy
+runtime a session error rather than a skip.
 
 ## Deliberate milestone limits
 
 H9.3l-j proves indexing, factorization, mixed feature forward, loss and a finite
 deterministic production-shape CPU step. The step uses state-free SGD only to
 exercise sparse table gradients without pre-empting the first-run optimizer
-discussion. It is not the production schedule.
+discussion. It is transparent to the caller's CPU RNG and to every already
+initialized CUDA RNG, including on exceptions, and it never initializes CUDA
+just to run the CPU healthcheck. The caller's thread count and deterministic
+algorithm mode, including PyTorch's independent `warn_only` flag, are restored
+as well. It is not the production schedule.
 
 Checkpoint/network serialization, final dependency/environment binding,
 controlled execution evidence and the first real training run belong to

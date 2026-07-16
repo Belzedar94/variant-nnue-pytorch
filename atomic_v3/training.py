@@ -151,10 +151,19 @@ def deterministic_cpu_one_step(
         raise ValueError("learning_rate must be finite and positive")
     previous_threads = torch.get_num_threads()
     deterministic_before = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only_before = (
+        torch.is_deterministic_algorithms_warn_only_enabled()
+    )
+    cpu_rng_before = torch.random.get_rng_state()
+    cuda_was_initialized = torch.cuda.is_initialized()
+    cuda_rng_before = torch.cuda.get_rng_state_all() if cuda_was_initialized else None
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
     try:
-        torch.manual_seed(seed)
+        # Seed only the CPU generator used by this CPU-only healthcheck.
+        # torch.manual_seed() would also alter CUDA generators (or enqueue a
+        # lazy CUDA seed), violating isolation from the real training run.
+        torch.random.default_generator.manual_seed(seed)
         fixture = load_canonical_fixture()
         # Role order is preserved exactly as authenticated by the fixture.
         train = fixture.batch("train")
@@ -204,5 +213,14 @@ def deterministic_cpu_one_step(
         gc.collect()
         return result
     finally:
-        torch.use_deterministic_algorithms(deterministic_before)
-        torch.set_num_threads(previous_threads)
+        try:
+            torch.random.set_rng_state(cpu_rng_before)
+            if cuda_rng_before is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_before)
+        finally:
+            # ``warn_only`` is independent global state. Preserve it as well,
+            # and restore the execution settings even if an RNG backend raises.
+            torch.use_deterministic_algorithms(
+                deterministic_before, warn_only=deterministic_warn_only_before
+            )
+            torch.set_num_threads(previous_threads)

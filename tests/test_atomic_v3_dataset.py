@@ -307,6 +307,48 @@ def test_provider_factory_consumes_the_fresh_manifest_bytes_not_mutable_path_aut
     )
 
 
+def test_post_authentication_symlink_swap_cannot_retarget_provenance_parent(
+    tmp_path, monkeypatch
+):
+    original = tmp_path / "original"
+    alternate = tmp_path / "alternate"
+    original.mkdir()
+    alternate.mkdir()
+    campaign, receipt, receipt_sha256, train, validation, _ = _campaign(original)
+    for artifact in (campaign, train, validation):
+        (alternate / artifact.name).write_bytes(artifact.read_bytes())
+
+    authenticated_read = v3_dataset._read_regular_authenticated
+    swapped = False
+
+    def race_after_authenticated_read(path, *args, **kwargs):
+        nonlocal swapped
+        snapshot = authenticated_read(path, *args, **kwargs)
+        if Path(path) == campaign and not swapped:
+            swapped = True
+            campaign.unlink()
+            try:
+                campaign.symlink_to(alternate / campaign.name)
+            except OSError as error:
+                pytest.skip(f"platform cannot create the symlink race fixture: {error}")
+        return snapshot
+
+    monkeypatch.setattr(
+        v3_dataset, "_read_regular_authenticated", race_after_authenticated_read
+    )
+    snapshot = inspect_campaign_roles(campaign, receipt, receipt_sha256)
+
+    # The immutable bytes and lexical path captured by the authenticated read
+    # stay paired. A later resolve() must not redirect manifest discovery or
+    # provenance labels into the alternate tree.
+    assert swapped
+    assert snapshot.campaign_path == Path(os.path.abspath(str(campaign)))
+    assert snapshot.campaign_path.parent == original
+    assert snapshot.train[0].path == train
+    assert snapshot.validation[0].path == validation
+    assert all(item.path.parent != alternate for item in snapshot.train + snapshot.validation)
+
+
 def test_publication_receipt_is_strict_sized_duplicate_free_json(tmp_path):
     campaign, receipt, _, _, _, receipt_document = _campaign(tmp_path)
     duplicate = json.dumps(receipt_document)[:-1] + ',"receipt_format":"duplicate"}\n'

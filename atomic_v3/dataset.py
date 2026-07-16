@@ -120,14 +120,33 @@ def _reject_linked_path_components(path: Path) -> None:
             )
 
 
+@dataclass(frozen=True)
+class _AuthenticatedFileSnapshot:
+    """Immutable bytes and lexical label captured by one authenticated read.
+
+    ``path`` is an absolute lexical provenance label, not later path authority.
+    It is fixed before opening and never replaced by a post-authentication
+    ``resolve()`` whose result could point through a raced symlink or parent.
+    """
+
+    path: Path
+    identity: tuple[int, int, int, int]
+    sha256: str
+    payload: bytes
+
+
 def _read_regular_authenticated(
     path: Path,
     expected_sha256: str,
     *,
     expected_bytes: Optional[int] = None,
     maximum: Optional[int] = None,
-) -> bytes:
+) -> _AuthenticatedFileSnapshot:
     expected_sha256 = _require_sha256("expected_sha256", expected_sha256)
+    # Freeze the non-authoritative provenance label before any filesystem I/O.
+    # Never call resolve() after authentication: an attacker could swap the
+    # just-read path to a symlink between those two operations.
+    path = Path(os.path.abspath(str(path)))
     _reject_linked_path_components(path)
     try:
         path_before = os.lstat(path)
@@ -180,7 +199,12 @@ def _read_regular_authenticated(
         raise DatasetContractError(
             f"artifact SHA-256 mismatch for {path.name}: expected {expected_sha256}, got {actual}"
         )
-    return payload
+    return _AuthenticatedFileSnapshot(
+        path=path,
+        identity=_file_identity(after),
+        sha256=actual,
+        payload=payload,
+    )
 
 
 @dataclass(frozen=True)
@@ -239,7 +263,8 @@ def _load_publication_receipt(
 ) -> PublicationReceiptSnapshot:
     path = _require_path("receipt_path", receipt_path)
     expected = _require_sha256("expected_receipt_sha256", expected_receipt_sha256)
-    raw = _read_regular_authenticated(path, expected, maximum=MAX_RECEIPT_BYTES)
+    artifact = _read_regular_authenticated(path, expected, maximum=MAX_RECEIPT_BYTES)
+    raw = artifact.payload
     document = _strict_json_document(raw, "publication receipt")
     if set(document) != _RECEIPT_KEYS:
         raise DatasetContractError("publication receipt fields differ from the frozen contract")
@@ -268,7 +293,7 @@ def _load_publication_receipt(
     if document["dataset_publication_ready"] is not True:
         raise DatasetContractError("campaign is not dataset-publication-ready")
     return PublicationReceiptSnapshot(
-        receipt_path=path.resolve(strict=True),
+        receipt_path=artifact.path,
         receipt_sha256=expected,
         validator_contract=document["validator_contract"],
         publication_contract_commit=document["publication_contract_commit"],
@@ -329,10 +354,17 @@ def _artifact_manifest(
     if descriptor["schema_sha256"] != ATOMIC_BIN_V2_MANIFEST_SCHEMA_SHA256:
         raise DatasetContractError("campaign role does not reference the pinned Atomic BIN V2 manifest schema")
     path = root / filename
-    payload = _read_regular_authenticated(
+    artifact = _read_regular_authenticated(
         path, digest, expected_bytes=byte_count, maximum=MAX_CAMPAIGN_BYTES
     )
-    return RoleManifest(chunk_index, first_record, records, path, digest, payload)
+    return RoleManifest(
+        chunk_index,
+        first_record,
+        records,
+        artifact.path,
+        digest,
+        artifact.payload,
+    )
 
 
 def _authenticate_campaign_roles(
@@ -342,10 +374,11 @@ def _authenticate_campaign_roles(
 ) -> CampaignInspectionSnapshot:
     receipt = _load_publication_receipt(receipt_path, expected_receipt_sha256)
     supplied_path = _require_path("campaign_path", campaign_path)
-    raw = _read_regular_authenticated(
+    campaign_artifact = _read_regular_authenticated(
         supplied_path, receipt.campaign_sha256, maximum=MAX_CAMPAIGN_BYTES
     )
-    path = supplied_path.resolve(strict=True)
+    raw = campaign_artifact.payload
+    path = campaign_artifact.path
     document = _strict_json_document(raw, "campaign")
     if document.get("schema_version") != 1 or document.get("status") != "completed":
         raise DatasetContractError("campaign is not a completed schema_version 1 document")
@@ -792,13 +825,10 @@ def load_canonical_fixture(
 ) -> CanonicalFixture:
     if path is None:
         path = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "atomic_v3" / "trainer-core-v1.json"
-    supplied_path = Path(path)
-    if supplied_path.is_symlink():
-        raise DatasetContractError("fixture symbolic links are forbidden")
-    fixture_path = supplied_path.resolve(strict=True)
-    raw = _read_regular_authenticated(
-        fixture_path, CANONICAL_FIXTURE_SHA256, maximum=1024 * 1024
+    fixture_artifact = _read_regular_authenticated(
+        Path(path), CANONICAL_FIXTURE_SHA256, maximum=1024 * 1024
     )
+    raw = fixture_artifact.payload
     try:
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except DatasetContractError:

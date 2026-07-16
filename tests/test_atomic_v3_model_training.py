@@ -6,7 +6,11 @@ import torch
 import atomic_v3.training as v3_training
 from atomic_v3.dataset import SparseSliceBatch, load_canonical_fixture
 from atomic_v3.dense import AtomicV3LayerStacks, fake_quantize_integer_bias
-from atomic_v3.model import AtomicNNUEV3, AtomicV3FeatureTransformer
+from atomic_v3.model import (
+    AtomicNNUEV3,
+    AtomicV3FeatureTransformer,
+    _clip_factorized_i32_sums_,
+)
 from atomic_v3.quantization import (
     FC0_BIAS_EXPORT_MAX,
     FC0_BIAS_EXPORT_MIN,
@@ -19,6 +23,8 @@ from atomic_v3.quantization import (
     FC2_BIAS_EXPORT_MIN,
     FC2_BIAS_SCALE,
     FT_ONE,
+    INT32_MAX,
+    INT32_MIN,
     PSQT_EXPORT_MAX,
     PSQT_EXPORT_MIN,
     PSQT_WEIGHT_SCALE,
@@ -62,13 +68,67 @@ def _tiny_model():
     return model
 
 
-def _fc0_serialized_integers(model, dtype):
-    base = model.network.fc0.linear.bias.to(dtype)
-    factor = model.network.fc0.factorized_linear.bias.repeat(8).to(dtype)
-    rounded = torch.round((base + factor) * FC0_BIAS_SCALE).to(torch.float64)
-    if torch.any(rounded < -(1 << 31)) or torch.any(rounded > (1 << 31) - 1):
-        raise OverflowError("FC0 bias is outside signed-i32 wire range")
+def _tiny_forward_batch(device):
+    active = SparseSliceBatch(
+        torch.tensor([[0]], dtype=torch.int32, device=device),
+        torch.tensor([[1.0]], dtype=torch.float32, device=device),
+    )
+    perspective = SimpleNamespace(
+        hm=active,
+        capture_pair=active,
+        king_blast_ep=active,
+        blast_ring=active,
+    )
+    return SimpleNamespace(
+        white=perspective,
+        black=perspective,
+        side_to_move_white=torch.ones((1, 1), dtype=torch.float32, device=device),
+        bucket_indices=torch.zeros(1, dtype=torch.long, device=device),
+    )
+
+
+def _rng_snapshot():
+    cpu = torch.random.get_rng_state().clone()
+    cuda = (
+        tuple(state.clone() for state in torch.cuda.get_rng_state_all())
+        if torch.cuda.is_initialized()
+        else None
+    )
+    return cpu, cuda
+
+
+def _assert_rng_snapshot_equal(expected):
+    cpu, cuda = _rng_snapshot()
+    assert torch.equal(cpu, expected[0])
+    if expected[1] is None:
+        assert cuda is None
+    else:
+        assert cuda is not None and len(cuda) == len(expected[1])
+        assert all(torch.equal(actual, saved) for actual, saved in zip(cuda, expected[1]))
+
+
+def _factorized_i32_serialized_integers(base, factor, dtype, scale, label):
+    """Future serializer boundary: range-check before the signed-i32 cast."""
+
+    merged = base.to(dtype) + factor.to(dtype)
+    # The mixed-width serializer widens the persisted sum before applying the
+    # integer scale; it must reject overflow before any signed cast.
+    rounded = torch.round(merged.to(torch.float64) * float(scale))
+    if not torch.all(torch.isfinite(rounded)) or torch.any(rounded < INT32_MIN) or torch.any(
+        rounded > INT32_MAX
+    ):
+        raise OverflowError(f"{label} is outside signed-i32 wire range")
     return rounded.to(torch.int64)
+
+
+def _fc0_serialized_integers(model, dtype):
+    return _factorized_i32_serialized_integers(
+        model.network.fc0.linear.bias,
+        model.network.fc0.factorized_linear.bias.repeat(8),
+        dtype,
+        FC0_BIAS_SCALE,
+        "FC0 bias",
+    )
 
 
 def _assert_fc0_serializable_in_both_widths(model):
@@ -76,6 +136,27 @@ def _assert_fc0_serializable_in_both_widths(model):
         integers = _fc0_serialized_integers(model, dtype)
         assert torch.all(integers >= -(1 << 31))
         assert torch.all(integers <= (1 << 31) - 1)
+
+
+def _hm_psqt_serialized_integers(transformer, dtype):
+    base = transformer.hm_bucket_weight[:, 1024:]
+    factor = transformer.hm_virtual_weight[:, 1024:]
+    if base.shape[0] % factor.shape[0] != 0:
+        raise ValueError("test HM factor shapes are inconsistent")
+    return _factorized_i32_serialized_integers(
+        base,
+        factor.repeat(base.shape[0] // factor.shape[0], 1),
+        dtype,
+        PSQT_WEIGHT_SCALE,
+        "HM PSQT weight",
+    )
+
+
+def _assert_hm_psqt_serializable_in_both_widths(transformer):
+    for dtype in (torch.float32, torch.float64):
+        integers = _hm_psqt_serialized_integers(transformer, dtype)
+        assert torch.all(integers >= INT32_MIN)
+        assert torch.all(integers <= INT32_MAX)
 
 
 def test_v3_composed_transformer_factorizes_hm_and_gives_relations_no_psqt():
@@ -178,6 +259,7 @@ def test_clip_weights_makes_mixed_tables_and_factor_sums_exportable():
     scaled_psqt = torch.round(hm_psqt.to(torch.float64) * PSQT_WEIGHT_SCALE)
     assert torch.all(scaled_psqt >= -(1 << 31))
     assert torch.all(scaled_psqt <= (1 << 31) - 1)
+    _assert_hm_psqt_serializable_in_both_widths(transformer)
 
     fc0_factor = model.network.fc0.factorized_linear.weight
     fc0_export = model.network.fc0.linear.weight + fc0_factor.repeat(8, 1)
@@ -286,6 +368,84 @@ def test_fc0_coordinated_clamp_fuzzes_nextafter_edges_in_both_widths():
     _assert_fc0_serializable_in_both_widths(model)
 
 
+def test_hm_psqt_opposite_sign_rounding_regressions_are_clipped_before_serialization():
+    transformer = _tiny_transformer()
+    with torch.no_grad():
+        # Both sums are just outside the signed-i32 domain after a float32
+        # limit subtraction has rounded the persisted base away from zero.
+        transformer.hm_bucket_weight[0, 1024:1026] = torch.tensor(
+            [345969.1875, -407320.25]
+        )
+        transformer.hm_virtual_weight[0, 1024:1026] = torch.tensor(
+            [-122272.96875, 183624.03125]
+        )
+
+    base = transformer.hm_bucket_weight[:, 1024:]
+    factor = transformer.hm_virtual_weight[:, 1024:]
+    before32 = torch.round((base + factor) * PSQT_WEIGHT_SCALE)
+    before64 = torch.round(
+        (base.to(torch.float64) + factor.to(torch.float64)) * PSQT_WEIGHT_SCALE
+    )
+    assert before32[0, 0].item() == 2147483648
+    assert before64[0, 0].item() == 2147483700
+    assert before64[0, 1].item() == -2147483700
+    with pytest.raises(OverflowError):
+        _hm_psqt_serialized_integers(transformer, torch.float32)
+    with pytest.raises(OverflowError):
+        _hm_psqt_serialized_integers(transformer, torch.float64)
+
+    transformer.clip_weights()
+    _assert_hm_psqt_serializable_in_both_widths(transformer)
+
+
+def test_hm_psqt_coordinated_clamp_randomized_persistent_wire_sweep():
+    generator = torch.Generator().manual_seed(0xA70C0003)
+    base = torch.nn.Parameter(torch.empty((32768, 8), dtype=torch.float32))
+    factor = torch.nn.Parameter(torch.empty((32768, 8), dtype=torch.float32))
+    with torch.no_grad():
+        base.uniform_(-1.0e9, 1.0e9, generator=generator)
+        factor.uniform_(PSQT_EXPORT_MIN, PSQT_EXPORT_MAX, generator=generator)
+        base[0, :2] = torch.tensor([345969.1875, -407320.25])
+        factor[0, :2] = torch.tensor([-122272.96875, 183624.03125])
+
+    original_device = base.device
+    original_dtype = base.dtype
+    _clip_factorized_i32_sums_(
+        base,
+        factor,
+        scale=PSQT_WEIGHT_SCALE,
+        minimum=PSQT_EXPORT_MIN,
+        maximum=PSQT_EXPORT_MAX,
+        label="HM PSQT randomized test",
+    )
+
+    assert base.device == factor.device == original_device
+    assert base.dtype == factor.dtype == original_dtype
+    assert base.requires_grad and factor.requires_grad
+    assert base.grad_fn is None and factor.grad_fn is None
+    for dtype in (torch.float32, torch.float64):
+        integers = _factorized_i32_serialized_integers(
+            base, factor, dtype, PSQT_WEIGHT_SCALE, "HM PSQT randomized test"
+        )
+        assert torch.all(integers >= INT32_MIN)
+        assert torch.all(integers <= INT32_MAX)
+
+
+@pytest.mark.parametrize("parameter", ["bucket", "factor"])
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_hm_psqt_factorized_clamp_rejects_nonfinite_operands(parameter, nonfinite):
+    transformer = _tiny_transformer()
+    with torch.no_grad():
+        target = (
+            transformer.hm_bucket_weight
+            if parameter == "bucket"
+            else transformer.hm_virtual_weight
+        )
+        target[0, 1024] = nonfinite
+    with pytest.raises(FloatingPointError, match="HM PSQT factor is non-finite"):
+        transformer.clip_weights()
+
+
 @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
 def test_clip_weights_rejects_nonfinite_dense_biases(nonfinite):
     model = _tiny_model()
@@ -328,9 +488,15 @@ def test_optimizer_step_clips_both_the_forward_boundary_and_persistent_state(mon
     assert model.weight.item() == -1.0
 
 
-def test_optimizer_step_keeps_all_dense_biases_i32_safe_before_and_after_update(monkeypatch):
+def test_optimizer_step_keeps_all_factorized_i32_sums_safe_before_and_after_update(monkeypatch):
     model = _tiny_model()
     with torch.no_grad():
+        model.feature_transformer.hm_bucket_weight[0, 1024:1026] = torch.tensor(
+            [345969.1875, -407320.25]
+        )
+        model.feature_transformer.hm_virtual_weight[0, 1024:1026] = torch.tensor(
+            [-122272.96875, 183624.03125]
+        )
         model.network.fc0.linear.bias[0:2] = torch.tensor([1.0e30, -1.0e30])
         model.network.fc0.factorized_linear.bias[0:2] = torch.tensor([1.0e30, -1.0e30])
         model.network.fc0.linear.bias[2:4] = torch.tensor(
@@ -352,6 +518,7 @@ def test_optimizer_step_keeps_all_dense_biases_i32_safe_before_and_after_update(
     observed_forward = []
 
     def assert_exportable(candidate):
+        _assert_hm_psqt_serializable_in_both_widths(candidate.feature_transformer)
         _assert_fc0_serializable_in_both_widths(candidate)
         cases = (
             (candidate.network.fc1.linear.bias, FC1_BIAS_SCALE),
@@ -391,6 +558,55 @@ def test_optimizer_step_keeps_all_dense_biases_i32_safe_before_and_after_update(
     assert model.network.fc1.linear.bias[1] > 0.0
     assert model.network.fc2.linear.bias[0] < 0.0
     assert model.network.fc2.linear.bias[1] > 0.0
+
+
+@pytest.mark.cuda_gate
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Atomic V3 CUDA smoke needs a GPU")
+def test_atomic_v3_cuda_clamp_forward_backward_and_optimizer_edges(monkeypatch):
+    device = torch.device("cuda")
+    model = _tiny_model().to(device)
+    batch = _tiny_forward_batch(device)
+    with torch.no_grad():
+        model.feature_transformer.hm_bucket_weight[0, 1024:1026] = torch.tensor(
+            [345969.1875, -407320.25], device=device
+        )
+        model.feature_transformer.hm_virtual_weight[0, 1024:1026] = torch.tensor(
+            [-122272.96875, 183624.03125], device=device
+        )
+        model.network.fc0.linear.bias[0:2] = torch.tensor(
+            [131072.0, -131072.015625], device=device
+        )
+        model.network.fc0.factorized_linear.bias[0:2] = torch.tensor(
+            [-1.0 / 256.0, 1.0 / 128.0], device=device
+        )
+
+    observed = []
+
+    def cuda_loss(candidate, ignored_batch, lambda_=0.5):
+        _assert_hm_psqt_serializable_in_both_widths(candidate.feature_transformer)
+        _assert_fc0_serializable_in_both_widths(candidate)
+        output = candidate(batch, validate=False)
+        assert output.device.type == "cuda"
+        assert torch.all(torch.isfinite(output))
+        observed.append(True)
+        return output.square().mean()
+
+    monkeypatch.setattr(v3_training, "batch_loss", cuda_loss)
+    optimizer = create_core_optimizer(model, learning_rate=1.0e-3)
+    reported = optimizer_step(model, optimizer, batch)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(torch.tensor(reported))
+    assert observed == [True]
+    _assert_hm_psqt_serializable_in_both_widths(model.feature_transformer)
+    _assert_fc0_serializable_in_both_widths(model)
+    assert model.feature_transformer.hm_bucket_weight.grad is not None
+    assert model.feature_transformer.hm_bucket_weight.grad.is_sparse
+    assert torch.all(
+        torch.isfinite(model.feature_transformer.hm_bucket_weight.grad.coalesce().values())
+    )
+    del optimizer, batch, model
+    torch.cuda.empty_cache()
 
 
 def test_sfnnv15_dense_tail_shapes_and_short_skip_are_frozen():
@@ -442,14 +658,85 @@ def test_production_shape_cpu_one_step_is_finite_and_deterministic():
     assert fixture.batch("train").batch_size == 2
     assert fixture.batch("validation").batch_size == 1
 
+    rng_before = _rng_snapshot()
     first = deterministic_cpu_one_step(seed=20260716)
+    _assert_rng_snapshot_equal(rng_before)
     second = deterministic_cpu_one_step(seed=20260716)
+    _assert_rng_snapshot_equal(rng_before)
 
     assert first == second
     assert first.train_loss_after < first.train_loss_before
     assert first.validation_loss_before >= 0.0
     assert first.validation_loss_after >= 0.0
     assert len(first.parameter_sha256) == 64
+
+
+def test_deterministic_cpu_step_restores_cpu_rng_when_fixture_raises(monkeypatch):
+    rng_before = _rng_snapshot()
+    monkeypatch.setattr(
+        v3_training,
+        "load_canonical_fixture",
+        lambda: (_ for _ in ()).throw(RuntimeError("fixture failure")),
+    )
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        deterministic_cpu_one_step(seed=20260716)
+    _assert_rng_snapshot_equal(rng_before)
+
+
+def test_deterministic_cpu_step_restores_warn_only_mode_when_fixture_raises(monkeypatch):
+    threads_before = torch.get_num_threads()
+    deterministic_before = torch.are_deterministic_algorithms_enabled()
+    warn_only_before = torch.is_deterministic_algorithms_warn_only_enabled()
+    monkeypatch.setattr(
+        v3_training,
+        "load_canonical_fixture",
+        lambda: (_ for _ in ()).throw(RuntimeError("fixture failure")),
+    )
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.raises(RuntimeError, match="fixture failure"):
+            deterministic_cpu_one_step(seed=20260716)
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.is_deterministic_algorithms_warn_only_enabled()
+        assert torch.get_num_threads() == threads_before
+    finally:
+        torch.use_deterministic_algorithms(
+            deterministic_before, warn_only=warn_only_before
+        )
+
+
+def test_deterministic_cpu_step_does_not_initialize_cuda_for_healthcheck(monkeypatch):
+    cpu_before = torch.random.get_rng_state().clone()
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("CPU healthcheck touched an uninitialized CUDA RNG")
+
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", forbidden)
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", forbidden)
+    monkeypatch.setattr(
+        v3_training,
+        "load_canonical_fixture",
+        lambda: (_ for _ in ()).throw(RuntimeError("fixture failure")),
+    )
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        deterministic_cpu_one_step(seed=20260716)
+    assert torch.equal(torch.random.get_rng_state(), cpu_before)
+
+
+@pytest.mark.cuda_gate
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RNG restore needs a GPU")
+def test_deterministic_cpu_step_restores_initialized_cuda_rng_on_exception(monkeypatch):
+    torch.cuda.manual_seed_all(0xA70C0003)
+    rng_before = _rng_snapshot()
+    monkeypatch.setattr(
+        v3_training,
+        "load_canonical_fixture",
+        lambda: (_ for _ in ()).throw(RuntimeError("fixture failure")),
+    )
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        deterministic_cpu_one_step(seed=20260716)
+    _assert_rng_snapshot_equal(rng_before)
 
 
 @pytest.mark.parametrize("learning_rate", [float("nan"), float("inf"), -float("inf"), 0.0])

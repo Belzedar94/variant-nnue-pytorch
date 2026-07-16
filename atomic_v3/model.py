@@ -40,6 +40,7 @@ from .quantization import (
     INT32_MIN,
     PSQT_EXPORT_MAX,
     PSQT_EXPORT_MIN,
+    PSQT_WEIGHT_SCALE,
     clip_feature_activation,
     fake_quantize_activation,
     fake_quantize_i16_feature,
@@ -47,6 +48,101 @@ from .quantization import (
     fake_quantize_psqt_output,
     fake_quantize_psqt_weight,
 )
+
+
+@torch.no_grad()
+def _clip_factorized_i32_sums_(
+    base: torch.Tensor,
+    expanded_factor: torch.Tensor,
+    *,
+    scale: float,
+    minimum: float,
+    maximum: float,
+    label: str,
+) -> None:
+    """Constrain persisted ``base + factor`` in both accumulation widths.
+
+    Computing ``maximum - factor`` in float32 is not sufficient.  When the two
+    operands have opposite signs, that subtraction can round the persisted
+    base outward; adding the operands again can then produce an i32 overflow.
+    Form the target in float64, write a coordinated float32 base, and correct
+    it with bounded ``nextafter`` steps until the *actual wire rounding* is in
+    range from both a float32 and float64 view of the persisted operands.
+    """
+
+    if base.dtype != torch.float32 or expanded_factor.dtype != torch.float32:
+        raise TypeError(f"Atomic V3 {label} factors must use float32 parameters")
+    if base.shape != expanded_factor.shape or base.device != expanded_factor.device:
+        raise ValueError(f"Atomic V3 {label} factor shapes/devices are inconsistent")
+    if not torch.all(torch.isfinite(base)) or not torch.all(torch.isfinite(expanded_factor)):
+        raise FloatingPointError(f"Atomic V3 {label} factor is non-finite")
+
+    target = (base.to(torch.float64) + expanded_factor.to(torch.float64)).clamp(
+        float(minimum), float(maximum)
+    )
+    base.copy_((target - expanded_factor.to(torch.float64)).to(base.dtype))
+
+    positive = base.new_full((), float("inf"))
+    negative = base.new_full((), float("-inf"))
+    correction_target = base + expanded_factor
+    for _ in range(4):
+        merged32 = base + expanded_factor
+        merged64 = base.to(torch.float64) + expanded_factor.to(torch.float64)
+        # Promote after the float32 arithmetic but before comparing with the
+        # asymmetric i32 endpoint.  Comparing INT32_MAX directly in float32
+        # rounds the threshold itself to 2**31 and masks the overflow.
+        integer32 = torch.round(merged32 * merged32.new_tensor(scale)).to(torch.float64)
+        integer32_wide = torch.round(merged32.to(torch.float64) * float(scale))
+        integer64 = torch.round(merged64 * float(scale))
+        too_low = (
+            (integer32 < INT32_MIN)
+            | (integer32_wide < INT32_MIN)
+            | (integer64 < INT32_MIN)
+        )
+        too_high = (
+            (integer32 > INT32_MAX)
+            | (integer32_wide > INT32_MAX)
+            | (integer64 > INT32_MAX)
+        )
+        # Correct in the coalesced value's ULP domain.  Moving the base itself
+        # is not bounded when cancellation makes the base much smaller than
+        # the factor: one base ULP can then be far too small to change the
+        # persisted sum.  Re-targeting one merged float32 ULP inward and
+        # solving for the base in float64 is bounded because |base| is at most
+        # twice the clamped coalesced/factor envelope.
+        correction_target = torch.where(
+            too_low,
+            torch.nextafter(correction_target, positive),
+            torch.where(
+                too_high,
+                torch.nextafter(correction_target, negative),
+                correction_target,
+            ),
+        )
+        corrected_base = (
+            correction_target.to(torch.float64) - expanded_factor.to(torch.float64)
+        ).to(base.dtype)
+        base.copy_(torch.where(too_low | too_high, corrected_base, base))
+
+    merged32 = base + expanded_factor
+    merged64 = base.to(torch.float64) + expanded_factor.to(torch.float64)
+    integer32 = torch.round(merged32 * merged32.new_tensor(scale)).to(torch.float64)
+    integer32_wide = torch.round(merged32.to(torch.float64) * float(scale))
+    integer64 = torch.round(merged64 * float(scale))
+    valid = (
+        torch.isfinite(merged32)
+        & torch.isfinite(merged64)
+        & (integer32 >= INT32_MIN)
+        & (integer32 <= INT32_MAX)
+        & (integer32_wide >= INT32_MIN)
+        & (integer32_wide <= INT32_MAX)
+        & (integer64 >= INT32_MIN)
+        & (integer64 <= INT32_MAX)
+    )
+    if not torch.all(valid):
+        raise FloatingPointError(
+            f"Atomic V3 {label} could not be made signed-i32 exportable"
+        )
 
 
 @torch.no_grad()
@@ -59,48 +155,19 @@ def _clip_factorized_i32_biases_(
     minimum: float,
     maximum: float,
 ) -> None:
-    """Constrain every persisted ``base + factor`` in both accumulation widths.
+    """Constrain every persisted factorized dense bias."""
 
-    Computing the clamp endpoint in float32 is not sufficient here.  Opposite
-    signs can make float32 addition round outward even though the exact sum is
-    safe, while float64 addition can expose an unsafe half-ulp hidden by the
-    float32 sum.  Form the target in float64, saturate it to the inward wire
-    interval, then cast the coordinated base back to its parameter dtype.  A
-    bounded nextafter correction verifies the actual persisted operands in
-    both widths before returning.
-    """
-
-    if base.dtype != torch.float32 or factor.dtype != torch.float32:
-        raise TypeError("Atomic V3 factorized dense biases must use float32 parameters")
     if base.ndim != 1 or factor.ndim != 1 or base.numel() != factor.numel() * count:
         raise ValueError("Atomic V3 factorized dense bias shapes are inconsistent")
-
     factor.clamp_(minimum, maximum)
-    expanded = factor.repeat(count)
-    target = (base.to(torch.float64) + expanded.to(torch.float64)).clamp(
-        float(minimum), float(maximum)
+    _clip_factorized_i32_sums_(
+        base,
+        factor.repeat(count),
+        scale=scale,
+        minimum=minimum,
+        maximum=maximum,
+        label="FC0 bias",
     )
-    base.copy_((target - expanded.to(torch.float64)).to(base.dtype))
-
-    positive = base.new_full((), float("inf"))
-    negative = base.new_full((), float("-inf"))
-    for _ in range(4):
-        merged32 = base + expanded
-        merged64 = base.to(torch.float64) + expanded.to(torch.float64)
-        # Promote after the float32 arithmetic but before comparing with the
-        # asymmetric i32 endpoint.  Comparing INT32_MAX directly in float32
-        # rounds the threshold itself to 2**31 and masks the overflow.
-        integer32 = torch.round(merged32 * merged32.new_tensor(scale)).to(torch.float64)
-        integer64 = torch.round(merged64 * float(scale))
-        too_low = (integer32 < INT32_MIN) | (integer64 < INT32_MIN)
-        too_high = (integer32 > INT32_MAX) | (integer64 > INT32_MAX)
-        if not torch.any(too_low | too_high):
-            return
-        lower = torch.nextafter(base, positive)
-        upper = torch.nextafter(base, negative)
-        base.copy_(torch.where(too_low, lower, torch.where(too_high, upper, base)))
-
-    raise FloatingPointError("Atomic V3 FC0 bias could not be made signed-i32 exportable")
 
 
 def _sparse_sum(
@@ -206,6 +273,12 @@ class AtomicV3FeatureTransformer(nn.Module):
         i8_min, i8_max = -128.0 / FT_ONE, 127.0 / FT_ONE
         psqt_min = PSQT_EXPORT_MIN
         psqt_max = PSQT_EXPORT_MAX
+        hm_psqt_base = self.hm_bucket_weight[:, ACCUMULATOR_DIMENSIONS:]
+        hm_psqt_factor = self.hm_virtual_weight[:, ACCUMULATOR_DIMENSIONS:]
+        if not torch.all(torch.isfinite(hm_psqt_base)) or not torch.all(
+            torch.isfinite(hm_psqt_factor)
+        ):
+            raise FloatingPointError("Atomic V3 HM PSQT factor is non-finite")
         self.bias.clamp_(i16_min, i16_max)
         self.capture_pair_weight.clamp_(i8_min, i8_max)
         self.king_blast_ep_weight.clamp_(i16_min, i16_max)
@@ -216,8 +289,12 @@ class AtomicV3FeatureTransformer(nn.Module):
         # production-size tensor.
         self.hm_virtual_weight[:, :ACCUMULATOR_DIMENSIONS].clamp_(i16_min, i16_max)
         self.hm_virtual_weight[:, ACCUMULATOR_DIMENSIONS:].clamp_(psqt_min, psqt_max)
-        for bucket in range(32):
-            begin, end = bucket * HM_VIRTUAL_DIMENSIONS, (bucket + 1) * HM_VIRTUAL_DIMENSIONS
+        if self.hm_bucket_weight.shape[0] % self.hm_virtual_weight.shape[0] != 0:
+            raise ValueError("Atomic V3 HM factor shapes are inconsistent")
+        factor_rows = self.hm_virtual_weight.shape[0]
+        factor_count = self.hm_bucket_weight.shape[0] // factor_rows
+        for bucket in range(factor_count):
+            begin, end = bucket * factor_rows, (bucket + 1) * factor_rows
             base = self.hm_bucket_weight[begin:end]
             virtual = self.hm_virtual_weight
             base_main = base[:, :ACCUMULATOR_DIMENSIONS]
@@ -228,14 +305,14 @@ class AtomicV3FeatureTransformer(nn.Module):
                     base_main.new_tensor(i16_min) - virtual_main,
                 )
             )
-            base_psqt = base[:, ACCUMULATOR_DIMENSIONS:]
-            virtual_psqt = virtual[:, ACCUMULATOR_DIMENSIONS:]
-            base_psqt.copy_(
-                torch.maximum(
-                    torch.minimum(base_psqt, base_psqt.new_tensor(psqt_max) - virtual_psqt),
-                    base_psqt.new_tensor(psqt_min) - virtual_psqt,
-                )
-            )
+        _clip_factorized_i32_sums_(
+            hm_psqt_base,
+            hm_psqt_factor.repeat(factor_count, 1),
+            scale=PSQT_WEIGHT_SCALE,
+            minimum=psqt_min,
+            maximum=psqt_max,
+            label="HM PSQT weight",
+        )
 
 
 class AtomicNNUEV3(nn.Module):
