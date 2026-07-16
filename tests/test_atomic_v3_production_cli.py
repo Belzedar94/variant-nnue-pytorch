@@ -510,6 +510,31 @@ def test_progress_reporter_persists_atomic_eta_and_checkpoint_payload(tmp_path):
     assert status["updated_at_utc"].endswith("Z")
 
 
+def test_provider_factory_passes_the_receipted_sha_to_native_binding(
+    tmp_path, monkeypatch
+):
+    snapshot = _snapshot(tmp_path)
+    provider_library = tmp_path / "provider.dll"
+    calls = []
+    sentinel = object()
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(production, "NativeAtomicV3Provider", create)
+    factory = production._provider_factory(
+        snapshot,
+        "train",
+        provider_library=provider_library,
+        provider_sha256=SHA_A,
+        device="cuda:0",
+    )
+    assert factory() is sentinel
+    assert calls[0]["library_path"] == provider_library
+    assert calls[0]["library_sha256"] == SHA_A
+
+
 def test_execute_all_runs_reuses_one_shared_state_and_updates_summary(
     tmp_path, monkeypatch
 ):

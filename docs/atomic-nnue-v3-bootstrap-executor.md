@@ -89,6 +89,15 @@ manifest/evidence closure, loads the provider DLL by an explicit path, and
 calls `prepare_production_run` then `run_production`. After epoch 37 it invokes
 the strict serializer exactly once. The four-run form is:
 
+The native binding canonicalizes that explicit path and binds it to the
+SHA-256 measured both before and after `CDLL` loading. A process-wide lock
+serializes the first load and every reuse rehashes the same path. Replacing,
+removing, or rebuilding those bytes after load fails closed and requires a
+fresh process; the SHA passed into checkpoint and receipt identity must equal
+the cached native-module SHA. The historical no-path loader remains only for
+legacy callers and is authenticated immediately after `nnue_dataset` imports
+its already-selected library; production never uses that weaker entry point.
+
 ```powershell
 python train_atomic_v3.py `
   --all-runs `

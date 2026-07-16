@@ -218,6 +218,7 @@ def _provider_factory(
     role: str,
     *,
     provider_library: Path,
+    provider_sha256: str,
     device: str,
 ):
     manifests = snapshot.manifests(role)
@@ -236,6 +237,7 @@ def _provider_factory(
             native_workers=1,
             device=device,
             library_path=provider_library,
+            library_sha256=provider_sha256,
             dataset_source="bootstrap",
             receipt_path=os.fspath(snapshot.receipt_path),
             receipt_sha256=snapshot.receipt_sha256,
@@ -534,10 +536,18 @@ def execute_one_run(
         },
     )
     training_factory = _provider_factory(
-        snapshot, "train", provider_library=provider_library, device=device
+        snapshot,
+        "train",
+        provider_library=provider_library,
+        provider_sha256=provider_sha256,
+        device=device,
     )
     validation_factory = _provider_factory(
-        snapshot, "validation", provider_library=provider_library, device=device
+        snapshot,
+        "validation",
+        provider_library=provider_library,
+        provider_sha256=provider_sha256,
+        device=device,
     )
     prepared: Optional[PreparedProductionRun] = None
     progress: Optional[_ProgressReporter] = None

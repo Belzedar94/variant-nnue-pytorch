@@ -10,9 +10,11 @@ observes the same deterministic prefix.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+import threading
+from typing import Any, Mapping, NoReturn, Optional, Sequence
 
 import numpy as np
 import torch
@@ -124,6 +126,9 @@ if ctypes.sizeof(ProviderCursorV1) != 88:
 
 _BOUND_LIBRARY = None
 _BOUND_LIBRARY_PATH: Optional[str] = None
+_BOUND_LIBRARY_SHA256: Optional[str] = None
+_BOUND_LIBRARY_POISONED: Optional[str] = None
+_BOUND_LIBRARY_LOCK = threading.RLock()
 
 
 def _decode_error(value: Optional[bytes], fallback: str) -> str:
@@ -132,44 +137,45 @@ def _decode_error(value: Optional[bytes], fallback: str) -> str:
     return value.decode("utf-8", errors="replace")
 
 
-def _bind_library(library_path: Optional[object] = None):
-    """Load and bind exactly one audited native provider library.
+def _canonical_library_path(library_path: object) -> str:
+    try:
+        requested = Path(os.fspath(library_path)).resolve(strict=True)
+    except (OSError, TypeError, ValueError) as error:
+        raise FileNotFoundError(
+            f"Atomic V3 provider library is not a file: {library_path}"
+        ) from error
+    if not requested.is_file():
+        raise FileNotFoundError(f"Atomic V3 provider library is not a file: {requested}")
+    return os.path.normcase(os.fspath(requested))
 
-    Production always supplies an absolute path.  The no-argument legacy path
-    remains for existing library consumers and tests, but a process may never
-    switch the provider ABI to a different shared object after the first bind.
-    """
 
-    global _BOUND_LIBRARY, _BOUND_LIBRARY_PATH
-    requested_path: Optional[str]
-    if library_path is None:
-        requested_path = None
-    else:
-        requested = Path(os.path.abspath(os.fspath(library_path)))
-        if not requested.is_file():
-            raise FileNotFoundError(f"Atomic V3 provider library is not a file: {requested}")
-        requested_path = os.path.normcase(os.fspath(requested))
-    if _BOUND_LIBRARY is not None:
-        if requested_path is not None and requested_path != _BOUND_LIBRARY_PATH:
-            raise RuntimeError(
-                "a different Atomic V3 provider library is already loaded in this process"
-            )
-        return _BOUND_LIBRARY
-    if requested_path is None:
-        # Reuse the loader selected by the legacy binding so one process cannot
-        # silently load two different native builds from the repository root.
-        import nnue_dataset
+def _library_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-        library = nnue_dataset.dll
-        loaded_path = getattr(nnue_dataset, "dllpath", None)
-        _BOUND_LIBRARY_PATH = (
-            os.path.normcase(os.path.abspath(os.fspath(loaded_path)))
-            if loaded_path is not None
-            else None
-        )
-    else:
-        library = ctypes.CDLL(requested_path)
-        _BOUND_LIBRARY_PATH = requested_path
+
+def _expected_sha256(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("provider library SHA-256 must be lowercase 64-digit hex")
+    return value
+
+
+def _poison_library_cache(reason: str) -> NoReturn:
+    global _BOUND_LIBRARY_POISONED
+    _BOUND_LIBRARY_POISONED = reason
+    raise RuntimeError(f"{reason}; start a fresh process")
+
+
+def _configure_library(library: Any) -> None:
     library.atomic_v3_provider_abi_version.argtypes = []
     library.atomic_v3_provider_abi_version.restype = ctypes.c_uint32
     library.atomic_v3_provider_creation_error.argtypes = []
@@ -204,8 +210,125 @@ def _bind_library(library_path: Optional[object] = None):
     library.atomic_v3_provider_committed_cursor.restype = ctypes.c_int32
     if library.atomic_v3_provider_abi_version() != ABI_VERSION:
         raise RuntimeError("native Atomic V3 provider ABI version differs")
-    _BOUND_LIBRARY = library
-    return library
+
+
+def _bind_library(
+    library_path: Optional[object] = None,
+    *,
+    expected_sha256: Optional[str] = None,
+) -> tuple[Any, str, str]:
+    """Load and bind exactly one audited native provider library.
+
+    Production always supplies an absolute path.  The no-argument legacy path
+    remains for existing library consumers and tests, but a process may never
+    switch the provider ABI to a different shared object after the first bind.
+    """
+
+    global _BOUND_LIBRARY, _BOUND_LIBRARY_PATH, _BOUND_LIBRARY_SHA256
+    global _BOUND_LIBRARY_POISONED
+    expected = _expected_sha256(expected_sha256)
+    requested_path = (
+        _canonical_library_path(library_path) if library_path is not None else None
+    )
+    with _BOUND_LIBRARY_LOCK:
+        if _BOUND_LIBRARY_POISONED is not None:
+            raise RuntimeError(
+                f"{_BOUND_LIBRARY_POISONED}; start a fresh process"
+            )
+        if _BOUND_LIBRARY is not None:
+            loaded_path = _BOUND_LIBRARY_PATH
+            loaded_sha256 = _BOUND_LIBRARY_SHA256
+            if loaded_path is None or loaded_sha256 is None:
+                _poison_library_cache("native provider cache identity is incomplete")
+            if requested_path is not None and requested_path != loaded_path:
+                raise RuntimeError(
+                    "a different Atomic V3 provider library is already loaded in this "
+                    "process; start a fresh process"
+                )
+            try:
+                current_sha256 = _library_sha256(loaded_path)
+            except OSError as error:
+                _poison_library_cache(
+                    f"loaded Atomic V3 provider library cannot be re-authenticated: {error}"
+                )
+            if current_sha256 != loaded_sha256:
+                _poison_library_cache(
+                    "loaded Atomic V3 provider library bytes changed on disk"
+                )
+            if expected is not None and expected != loaded_sha256:
+                raise RuntimeError(
+                    "requested provider SHA-256 differs from the native module already "
+                    "loaded; start a fresh process"
+                )
+            return _BOUND_LIBRARY, loaded_sha256, loaded_path
+
+        legacy_load = requested_path is None
+        if legacy_load:
+            # Legacy callers historically let nnue_dataset select and load the
+            # shared object.  That import predates our first possible hash, so
+            # it is retained only as a compatibility path.  Production always
+            # supplies an explicit canonical path plus expected SHA-256.
+            import nnue_dataset
+
+            loaded_path = getattr(nnue_dataset, "dllpath", None)
+            if loaded_path is None:
+                raise RuntimeError(
+                    "legacy native provider loader did not expose its library path"
+                )
+            requested_path = _canonical_library_path(loaded_path)
+            library = nnue_dataset.dll
+            try:
+                before_sha256 = _library_sha256(requested_path)
+            except OSError as error:
+                _poison_library_cache(
+                    "legacy Atomic V3 provider entered the process but its bytes "
+                    f"cannot be authenticated: {error}"
+                )
+        else:
+            before_sha256 = _library_sha256(requested_path)
+            if expected is not None and before_sha256 != expected:
+                raise RuntimeError(
+                    "provider library SHA-256 changed before native loading"
+                )
+            library = ctypes.CDLL(requested_path)
+            try:
+                after_load_sha256 = _library_sha256(requested_path)
+            except OSError as error:
+                _poison_library_cache(
+                    f"Atomic V3 provider library vanished while CDLL loaded it: {error}"
+                )
+            if after_load_sha256 != before_sha256:
+                _poison_library_cache(
+                    "Atomic V3 provider library bytes changed while CDLL loaded it"
+                )
+
+        if expected is not None and before_sha256 != expected:
+            if legacy_load:
+                _poison_library_cache(
+                    "legacy Atomic V3 provider bytes differ from the expected SHA-256"
+                )
+            raise RuntimeError("provider library SHA-256 differs from expected bytes")
+        try:
+            _configure_library(library)
+        except BaseException:
+            _BOUND_LIBRARY_POISONED = (
+                "Atomic V3 provider library failed binding after entering the process"
+            )
+            raise
+        try:
+            after_bind_sha256 = _library_sha256(requested_path)
+        except OSError as error:
+            _poison_library_cache(
+                f"Atomic V3 provider library vanished during native binding: {error}"
+            )
+        if after_bind_sha256 != before_sha256:
+            _poison_library_cache(
+                "Atomic V3 provider library bytes changed during native binding"
+            )
+        _BOUND_LIBRARY = library
+        _BOUND_LIBRARY_PATH = requested_path
+        _BOUND_LIBRARY_SHA256 = before_sha256
+        return library, before_sha256, requested_path
 
 
 def _plain_int(name: str, value: object, minimum: int, maximum: int) -> int:
@@ -336,6 +459,7 @@ class NativeAtomicV3Provider:
         cyclic: Optional[bool] = None,
         device: object = "cpu",
         library_path: Optional[object] = None,
+        library_sha256: Optional[str] = None,
         resume_state: Optional[Mapping[str, Any]] = None,
         **provenance: Any,
     ) -> None:
@@ -377,7 +501,18 @@ class NativeAtomicV3Provider:
             if library_path is not None
             else None
         )
-        self._library = _bind_library(self.library_path)
+        (
+            self._library,
+            self.library_sha256,
+            self.loaded_library_path,
+        ) = _bind_library(
+            self.library_path,
+            expected_sha256=library_sha256,
+        )
+        if library_sha256 is not None and self.library_sha256 != library_sha256:
+            raise RuntimeError(
+                "loaded native provider SHA-256 differs from the requested identity"
+            )
         self._stream = ctypes.c_void_p()
         self._stream = self._new_stream(resume_state)
         self._initial_cursor = self.logical_cursor_state()

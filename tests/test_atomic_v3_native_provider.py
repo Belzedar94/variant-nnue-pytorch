@@ -1,14 +1,259 @@
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import struct
+import sys
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import atomic_v3.native_provider as native_provider_module
 from atomic_v3.contract import BACKEND_KEY
 from atomic_v3.dataset import validate_batch
 from atomic_v3.executor import ProviderBatch, ResumableBatchProvider
 from atomic_v3.native_provider import NativeAtomicV3Provider, NativeProviderError
+
+
+class _FakeFunction:
+    def __init__(self, result=0):
+        self.result = result
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        return self.result
+
+
+class _FakeLibrary:
+    def __getattr__(self, name):
+        result = (
+            native_provider_module.ABI_VERSION
+            if name == "atomic_v3_provider_abi_version"
+            else 0
+        )
+        function = _FakeFunction(result)
+        setattr(self, name, function)
+        return function
+
+
+def _reset_library_cache(monkeypatch):
+    monkeypatch.setattr(native_provider_module, "_BOUND_LIBRARY", None)
+    monkeypatch.setattr(native_provider_module, "_BOUND_LIBRARY_PATH", None)
+    monkeypatch.setattr(native_provider_module, "_BOUND_LIBRARY_SHA256", None)
+    monkeypatch.setattr(native_provider_module, "_BOUND_LIBRARY_POISONED", None)
+
+
+def _file_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_native_library_cache_reuses_unchanged_canonical_path(tmp_path, monkeypatch):
+    _reset_library_cache(monkeypatch)
+    library_path = tmp_path / "provider.dll"
+    library_path.write_bytes(b"stable-provider")
+    expected = _file_sha256(library_path)
+    library = _FakeLibrary()
+    loads = []
+
+    def load(path):
+        loads.append(path)
+        return library
+
+    monkeypatch.setattr(native_provider_module.ctypes, "CDLL", load)
+    first = native_provider_module._bind_library(
+        library_path, expected_sha256=expected
+    )
+    second = native_provider_module._bind_library(
+        library_path.parent / "." / library_path.name,
+        expected_sha256=expected,
+    )
+    assert first == second
+    assert first[0] is library
+    assert first[1] == expected
+    assert first[2] == native_provider_module._canonical_library_path(library_path)
+    assert loads == [first[2]]
+
+
+def test_native_library_rejects_stale_expected_sha_before_cdll(tmp_path, monkeypatch):
+    _reset_library_cache(monkeypatch)
+    library_path = tmp_path / "provider.dll"
+    library_path.write_bytes(b"current-provider")
+    loads = []
+    monkeypatch.setattr(
+        native_provider_module.ctypes,
+        "CDLL",
+        lambda path: loads.append(path) or _FakeLibrary(),
+    )
+    with pytest.raises(RuntimeError, match="changed before native loading"):
+        native_provider_module._bind_library(
+            library_path,
+            expected_sha256=hashlib.sha256(b"stale-provider").hexdigest(),
+        )
+    assert loads == []
+    assert native_provider_module._BOUND_LIBRARY is None
+
+
+def test_native_library_cache_rejects_changed_bytes_until_fresh_process(
+    tmp_path, monkeypatch
+):
+    _reset_library_cache(monkeypatch)
+    library_path = tmp_path / "provider.dll"
+    library_path.write_bytes(b"provider-v1")
+    original_sha256 = _file_sha256(library_path)
+    loads = []
+    monkeypatch.setattr(
+        native_provider_module.ctypes,
+        "CDLL",
+        lambda path: loads.append(path) or _FakeLibrary(),
+    )
+    native_provider_module._bind_library(
+        library_path, expected_sha256=original_sha256
+    )
+
+    library_path.write_bytes(b"provider-v2")
+    with pytest.raises(RuntimeError, match="bytes changed.*fresh process"):
+        native_provider_module._bind_library(
+            library_path, expected_sha256=_file_sha256(library_path)
+        )
+    library_path.write_bytes(b"provider-v1")
+    with pytest.raises(RuntimeError, match="fresh process"):
+        native_provider_module._bind_library(
+            library_path, expected_sha256=original_sha256
+        )
+    assert len(loads) == 1
+
+
+def test_native_library_cache_rejects_change_during_cdll_load(tmp_path, monkeypatch):
+    _reset_library_cache(monkeypatch)
+    library_path = tmp_path / "provider.dll"
+    library_path.write_bytes(b"provider-before")
+    expected = _file_sha256(library_path)
+
+    def load(path):
+        library_path.write_bytes(b"provider-after")
+        return _FakeLibrary()
+
+    monkeypatch.setattr(native_provider_module.ctypes, "CDLL", load)
+    with pytest.raises(RuntimeError, match="while CDLL loaded it.*fresh process"):
+        native_provider_module._bind_library(
+            library_path, expected_sha256=expected
+        )
+    assert native_provider_module._BOUND_LIBRARY is None
+    with pytest.raises(RuntimeError, match="fresh process"):
+        native_provider_module._bind_library(
+            library_path, expected_sha256=_file_sha256(library_path)
+        )
+
+
+@pytest.mark.parametrize(
+    ("failure_call", "message"),
+    ((2, "while CDLL loaded it"), (3, "during native binding")),
+)
+def test_native_library_cache_poisoned_when_post_cdll_rehash_fails(
+    tmp_path, monkeypatch, failure_call, message
+):
+    _reset_library_cache(monkeypatch)
+    library_path = tmp_path / "provider.dll"
+    library_path.write_bytes(b"provider")
+    expected = _file_sha256(library_path)
+    real_hash = native_provider_module._library_sha256
+    calls = 0
+
+    def hash_then_fail(path):
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise OSError("injected post-CDLL disappearance")
+        return real_hash(path)
+
+    monkeypatch.setattr(native_provider_module, "_library_sha256", hash_then_fail)
+    monkeypatch.setattr(
+        native_provider_module.ctypes, "CDLL", lambda path: _FakeLibrary()
+    )
+    with pytest.raises(RuntimeError, match=f"vanished {message}.*fresh process"):
+        native_provider_module._bind_library(
+            library_path, expected_sha256=expected
+        )
+    with pytest.raises(RuntimeError, match="fresh process"):
+        native_provider_module._bind_library(
+            library_path, expected_sha256=expected
+        )
+
+
+def test_legacy_library_hash_failure_after_import_poisons_cache(tmp_path, monkeypatch):
+    _reset_library_cache(monkeypatch)
+    library_path = tmp_path / "provider.dll"
+    library_path.write_bytes(b"legacy-provider")
+    monkeypatch.setitem(
+        sys.modules,
+        "nnue_dataset",
+        SimpleNamespace(dllpath=str(library_path), dll=_FakeLibrary()),
+    )
+
+    def fail_hash(path):
+        raise OSError("injected legacy rehash failure")
+
+    monkeypatch.setattr(native_provider_module, "_library_sha256", fail_hash)
+    with pytest.raises(RuntimeError, match="legacy.*cannot be authenticated.*fresh process"):
+        native_provider_module._bind_library()
+    with pytest.raises(RuntimeError, match="fresh process"):
+        native_provider_module._bind_library()
+
+
+def test_native_library_cache_rejects_distinct_canonical_path(tmp_path, monkeypatch):
+    _reset_library_cache(monkeypatch)
+    first_path = tmp_path / "provider-a.dll"
+    second_path = tmp_path / "provider-b.dll"
+    first_path.write_bytes(b"same-provider")
+    second_path.write_bytes(b"same-provider")
+    loads = []
+    monkeypatch.setattr(
+        native_provider_module.ctypes,
+        "CDLL",
+        lambda path: loads.append(path) or _FakeLibrary(),
+    )
+    native_provider_module._bind_library(
+        first_path, expected_sha256=_file_sha256(first_path)
+    )
+    with pytest.raises(RuntimeError, match="different.*fresh process"):
+        native_provider_module._bind_library(
+            second_path, expected_sha256=_file_sha256(second_path)
+        )
+    assert len(loads) == 1
+
+
+def test_native_library_cache_serializes_concurrent_first_load(tmp_path, monkeypatch):
+    _reset_library_cache(monkeypatch)
+    library_path = tmp_path / "provider.dll"
+    library_path.write_bytes(b"concurrent-provider")
+    expected = _file_sha256(library_path)
+    library = _FakeLibrary()
+    load_lock = threading.Lock()
+    loads = 0
+
+    def load(path):
+        nonlocal loads
+        with load_lock:
+            loads += 1
+        time.sleep(0.05)
+        return library
+
+    monkeypatch.setattr(native_provider_module.ctypes, "CDLL", load)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda _: native_provider_module._bind_library(
+                    library_path, expected_sha256=expected
+                ),
+                range(8),
+            )
+        )
+    assert loads == 1
+    assert all(result == results[0] for result in results)
+    assert all(result[0] is library for result in results)
 
 
 def _arguments(manifest, *, role="validation", batch_size=8, skipping=0, resume=None):
