@@ -43,6 +43,8 @@ from atomic_v3.serialization import (
     _quantized_numpy_preserving_i32,
     _validate_dense_summaries,
     _validate_psqt,
+    _write_all,
+    _write_compressed_arrays,
     check_nnue,
     decode_signed_leb128,
     dumps_header,
@@ -135,6 +137,40 @@ def test_v3_streaming_compressed_array_rejects_noncanonical_values():
     np.testing.assert_array_equal(
         read_compressed_array(output, values.size, values.dtype), values
     )
+
+
+@pytest.mark.parametrize("mode", ["none", "zero", "short"])
+def test_write_all_rejects_incomplete_sink_writes(mode):
+    class AdversarialSink:
+        def write(self, data):
+            if mode == "none":
+                return None
+            if mode == "zero":
+                return 0
+            return len(data) - 1
+
+    with pytest.raises(AtomicV3FormatError, match="short write"):
+        _write_all(AdversarialSink(), b"Atomic V3", "adversarial payload")
+
+
+def test_streamed_compressed_payload_uses_checked_sink_writes():
+    class PayloadShortSink(io.BytesIO):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def write(self, data):
+            self.calls += 1
+            if self.calls == 3:
+                return super().write(data[:-1])
+            return super().write(data)
+
+    sink = PayloadShortSink()
+    with pytest.raises(AtomicV3FormatError, match="short write"):
+        _write_compressed_arrays(
+            sink, [np.zeros(10, dtype="<i2")], 10, "adversarial array"
+        )
+    assert sink.calls == 3
 
 
 def test_v3_header_is_exact_and_preserves_opaque_description_bytes():
@@ -333,7 +369,20 @@ def _write_zero_frame(stream, count):
     _write_zeros(stream, count)
 
 
-def _write_zero_network(path: Path, description=b"Atomic V3 Python zero wire"):
+def _write_first_i32_frame(stream, count, first):
+    encoded = encode_signed_leb128([first], np.dtype("<i4"))
+    stream.write(LEB128_MAGIC)
+    stream.write(struct.pack("<I", len(encoded) + count - 1))
+    stream.write(encoded)
+    _write_zeros(stream, count - 1)
+
+
+def _write_zero_network(
+    path: Path,
+    description=b"Atomic V3 Python zero wire",
+    *,
+    i32_alias_boundaries=False,
+):
     with path.open("xb") as stream:
         stream.write(struct.pack("<III", FILE_VERSION, NETWORK_HASH, len(description)))
         stream.write(description)
@@ -349,11 +398,26 @@ def _write_zero_network(path: Path, description=b"Atomic V3 Python zero wire"):
             stream, KING_BLAST_EP_DIMENSIONS * ACCUMULATOR_DIMENSIONS
         )
         _write_zeros(stream, BLAST_RING_DIMENSIONS * ACCUMULATOR_DIMENSIONS)
-        _write_zero_frame(stream, HM_PHYSICAL_DIMENSIONS * PSQT_BUCKETS)
+        if i32_alias_boundaries:
+            _write_first_i32_frame(
+                stream, HM_PHYSICAL_DIMENSIONS * PSQT_BUCKETS, (1 << 31) - 1
+            )
+        else:
+            _write_zero_frame(stream, HM_PHYSICAL_DIMENSIONS * PSQT_BUCKETS)
         for _ in range(LAYER_STACKS):
             stream.write(struct.pack("<I", ARCHITECTURE_HASH))
-            _write_zeros(stream, 32 * 4 + 32 * 1024)
-            _write_zeros(stream, 32 * 4 + 32 * 64)
+            if i32_alias_boundaries:
+                stream.write(struct.pack("<i", (1 << 31) - 1))
+                _write_zeros(stream, 31 * 4)
+            else:
+                _write_zeros(stream, 32 * 4)
+            _write_zeros(stream, 32 * 1024)
+            if i32_alias_boundaries:
+                stream.write(struct.pack("<i", -((1 << 31) - 1)))
+                _write_zeros(stream, 31 * 4)
+            else:
+                _write_zeros(stream, 32 * 4)
+            _write_zeros(stream, 32 * 64)
             _write_zeros(stream, 4 + 128)
 
 
@@ -369,7 +433,8 @@ def _sha256(path):
 def test_checker_and_import_export_round_trip_the_complete_zero_wire(tmp_path):
     source = tmp_path / "zero-v3.nnue"
     target = tmp_path / "zero-v3-reexport.nnue"
-    _write_zero_network(source)
+    checkpoint = tmp_path / "zero-v3-state.pt"
+    _write_zero_network(source, i32_alias_boundaries=True)
     expected_sha = _sha256(source)
 
     with source.open("rb") as stream:
@@ -383,12 +448,41 @@ def test_checker_and_import_export_round_trip_the_complete_zero_wire(tmp_path):
     assert description == metadata.description
     assert torch.count_nonzero(model.feature_transformer.hm_virtual_weight) == 0
     assert model.feature_transformer.hm_bucket_weight[0, 0].item() == 0.0
-    published = save_nnue(target, model, description)
+    assert model._atomic_v3_imported_i32_valid.item() is True
+    assert model._atomic_v3_imported_hm_psqt_i32[0, 0].item() == (1 << 31) - 1
+    assert model._atomic_v3_imported_fc0_bias_i32[0, 0].item() == (1 << 31) - 1
+    assert model._atomic_v3_imported_fc1_bias_i32[0, 0].item() == -((1 << 31) - 1)
+    imported_buffer_names = {
+        name
+        for name, _ in model.named_buffers()
+        if name.startswith("_atomic_v3_imported_")
+    }
+    assert imported_buffer_names == {
+        "_atomic_v3_imported_i32_valid",
+        "_atomic_v3_imported_hm_psqt_i32",
+        "_atomic_v3_imported_fc0_bias_i32",
+        "_atomic_v3_imported_fc1_bias_i32",
+        "_atomic_v3_imported_fc2_bias_i32",
+    }
+    assert not any(
+        name.startswith("_atomic_v3_imported_")
+        for name, _ in model.named_parameters()
+    )
+    torch.save(model.state_dict(), checkpoint)
+    del model
+    gc.collect()
+
+    restored = AtomicNNUEV3(initialize=False)
+    restored.load_state_dict(
+        torch.load(checkpoint, map_location="cpu", weights_only=True), strict=True
+    )
+    assert restored._atomic_v3_imported_i32_valid.item() is True
+    published = save_nnue(target, restored, description)
     assert target.stat().st_size == source.stat().st_size
     assert published.size == target.stat().st_size
     assert _sha256(target) == expected_sha
     assert published.sha256 == expected_sha
-    del model
+    del restored
     gc.collect()
 
     with source.open("ab") as stream:

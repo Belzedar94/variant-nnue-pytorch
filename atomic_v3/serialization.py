@@ -18,7 +18,6 @@ import heapq
 import io
 import os
 from pathlib import Path
-import shutil
 import struct
 import tempfile
 from typing import BinaryIO, Callable, Iterable, Iterator, Optional
@@ -157,14 +156,11 @@ def _write_all(
     stream: BinaryIO, data: bytes | bytearray | memoryview, label: str
 ) -> None:
     view = memoryview(data).cast("B")
-    offset = 0
-    while offset < len(view):
-        written = stream.write(view[offset:])
-        if written is None:
-            return
-        if written <= 0:
-            raise AtomicV3FormatError(f"short write while writing {label}")
-        offset += written
+    if not view:
+        return
+    written = stream.write(view)
+    if written is None or written != len(view):
+        raise AtomicV3FormatError(f"short write while writing {label}")
 
 
 def _read_exact(stream: BinaryIO, size: int, label: str) -> bytes:
@@ -652,8 +648,65 @@ def _iter_quantized(
 
 
 def _imported_i32_state(model: AtomicNNUEV3) -> Optional[_ImportedI32State]:
-    state = getattr(model, "_atomic_v3_imported_i32", None)
-    return state if isinstance(state, _ImportedI32State) else None
+    valid = getattr(model, "_atomic_v3_imported_i32_valid", None)
+    if valid is None:
+        # Lightweight model doubles used by focused serializer tests predate
+        # the persistent provenance buffers and have no imported i32 state.
+        return None
+    if (
+        not isinstance(valid, torch.Tensor)
+        or valid.dtype != torch.bool
+        or tuple(valid.shape) != ()
+    ):
+        raise AtomicV3FormatError("invalid imported-i32 checkpoint validity buffer")
+    if not bool(valid.detach().to(device="cpu").item()):
+        return None
+
+    specifications = (
+        (
+            "HM PSQT",
+            "_atomic_v3_imported_hm_psqt_i32",
+            (HM_PHYSICAL_DIMENSIONS, PSQT_BUCKETS),
+        ),
+        (
+            "FC0 bias",
+            "_atomic_v3_imported_fc0_bias_i32",
+            (LAYER_STACKS, FC0_OUTPUTS),
+        ),
+        (
+            "FC1 bias",
+            "_atomic_v3_imported_fc1_bias_i32",
+            (LAYER_STACKS, FC1_OUTPUTS),
+        ),
+        (
+            "FC2 bias",
+            "_atomic_v3_imported_fc2_bias_i32",
+            (LAYER_STACKS, FC2_OUTPUTS),
+        ),
+    )
+    arrays: list[np.ndarray] = []
+    for label, attribute, shape in specifications:
+        tensor = getattr(model, attribute, None)
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.layout != torch.strided
+            or tensor.dtype != torch.int32
+            or tuple(tensor.shape) != shape
+        ):
+            raise AtomicV3FormatError(
+                f"invalid imported-i32 checkpoint buffer for {label}"
+            )
+        arrays.append(
+            _readonly_i32(
+                tensor.detach().to(device="cpu").contiguous().numpy()
+            )
+        )
+
+    dense_biases = tuple(
+        (arrays[1][bucket], arrays[2][bucket], arrays[3][bucket])
+        for bucket in range(LAYER_STACKS)
+    )
+    return _ImportedI32State(arrays[0], dense_biases)
 
 
 def _iter_quantized_hm_psqt(model: AtomicNNUEV3) -> Iterator[np.ndarray]:
@@ -716,7 +769,11 @@ def _write_compressed_arrays(
         _write_all(stream, LEB128_MAGIC, f"{label} compressed magic")
         _write_u32(stream, byte_count)
         encoded.seek(0)
-        shutil.copyfileobj(encoded, stream, length=STREAM_CHUNK_BYTES)
+        while True:
+            block = encoded.read(STREAM_CHUNK_BYTES)
+            if not block:
+                break
+            _write_all(stream, block, f"{label} compressed payload")
 
 
 def _write_raw_i8_quantized(
@@ -1404,16 +1461,27 @@ def _parse_body(stream: BinaryIO, model: Optional[AtomicNNUEV3]) -> None:
     if model is not None:
         if imported_psqt is None or len(imported_dense_biases) != LAYER_STACKS:
             raise AssertionError("Atomic V3 imported i32 state is incomplete")
-        object.__setattr__(
-            model,
-            "_atomic_v3_imported_i32",
-            _ImportedI32State(
-                _readonly_i32(imported_psqt).reshape(
-                    HM_PHYSICAL_DIMENSIONS, PSQT_BUCKETS
-                ),
-                tuple(imported_dense_biases),
-            ),
+        model._atomic_v3_imported_hm_psqt_i32.copy_(
+            torch.from_numpy(
+                imported_psqt.reshape(HM_PHYSICAL_DIMENSIONS, PSQT_BUCKETS)
+            )
         )
+        model._atomic_v3_imported_fc0_bias_i32.copy_(
+            torch.from_numpy(
+                np.stack([biases[0] for biases in imported_dense_biases])
+            )
+        )
+        model._atomic_v3_imported_fc1_bias_i32.copy_(
+            torch.from_numpy(
+                np.stack([biases[1] for biases in imported_dense_biases])
+            )
+        )
+        model._atomic_v3_imported_fc2_bias_i32.copy_(
+            torch.from_numpy(
+                np.stack([biases[2] for biases in imported_dense_biases])
+            )
+        )
+        model._atomic_v3_imported_i32_valid.fill_(True)
 
 
 def _read_prefix(stream: BinaryIO) -> bytes:
