@@ -158,7 +158,11 @@ def dry_run_document(arguments: argparse.Namespace) -> dict[str, object]:
     return document
 
 
-def _print_json(document: object, *, stream=sys.stdout) -> None:
+def _print_json(document: object, *, stream=None) -> None:
+    # Resolve stdout at call time so redirection/capture preserves the CLI's
+    # single-document contract instead of retaining an import-time stream.
+    if stream is None:
+        stream = sys.stdout
     print(
         json.dumps(
             document,

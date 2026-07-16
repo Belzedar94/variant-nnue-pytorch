@@ -17,6 +17,7 @@ from atomic_v3.checkpoint import TrainingCounters
 from atomic_v3.dataset import RoleManifest
 from atomic_v3.executor import SharedInitialState
 from atomic_v3.serialization import WireMetadata
+from ranger import Ranger
 import train_atomic_v3
 
 
@@ -579,13 +580,18 @@ def test_execute_all_runs_reuses_one_shared_state_and_updates_summary(
     assert json.loads((output / "training-summary.json").read_text()) == summary
 
 
-def test_cli_routes_non_dry_execution_to_normative_orchestrator(tmp_path, monkeypatch):
+def test_cli_routes_non_dry_execution_to_normative_orchestrator(
+    tmp_path, monkeypatch, capfd
+):
     provider = tmp_path / "provider.dll"
     provider.write_bytes(b"provider")
     calls = []
 
     def execute(**kwargs):
         calls.append(kwargs)
+        model = torch.nn.Linear(1, 1)
+        optimizer = Ranger(model.parameters(), use_gc=True, gc_loc=False)
+        optimizer.__setstate__(optimizer.__getstate__())
         return {"status": "completed", "results": []}
 
     monkeypatch.setattr(train_atomic_v3, "execute_runs", execute)
@@ -611,3 +617,39 @@ def test_cli_routes_non_dry_execution_to_normative_orchestrator(tmp_path, monkey
     assert calls[0]["run_ids"] == tuple(executor_module.RUN_CONFIGS)
     assert calls[0]["resume"] is True
     assert calls[0]["device"] == "cuda:0"
+    captured = capfd.readouterr()
+    assert json.loads(captured.out) == {"status": "completed", "results": []}
+    assert captured.err == ""
+
+
+def test_canary_cli_reserves_stdout_for_one_json_document(monkeypatch, capfd):
+    import scripts.canary_atomic_v3_production as canary
+
+    expected = {"format": canary.CANARY_FORMAT, "status": "passed"}
+
+    def run_canary(_arguments):
+        model = torch.nn.Linear(1, 1)
+        optimizer = Ranger(model.parameters(), use_gc=True, gc_loc=False)
+        optimizer.__setstate__(optimizer.__getstate__())
+        return expected
+
+    monkeypatch.setattr(canary, "run_canary", run_canary)
+    assert canary.main(
+        [
+            "--bootstrap-source",
+            "receipt.json",
+            SHA_A,
+            "--provider-library",
+            "provider.dll",
+            "--work-dir",
+            "work",
+            "--shared-initial-state",
+            "shared.pt",
+            "--trainer-commit",
+            TRAINER_COMMIT,
+        ]
+    ) == 0
+
+    captured = capfd.readouterr()
+    assert json.loads(captured.out) == expected
+    assert captured.err == ""

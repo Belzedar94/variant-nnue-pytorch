@@ -270,6 +270,26 @@ def _tiny_components():
     return model, optimizer, scheduler
 
 
+def test_ranger_construction_and_state_restore_are_silent(capsys):
+    model = nn.Linear(1, 1, bias=True)
+    optimizer = Ranger(
+        model.parameters(),
+        lr=0.01,
+        use_gc=True,
+        gc_conv_only=False,
+        gc_loc=False,
+    )
+
+    # Exercise the exact hook used by Python/Torch object restoration.  An
+    # optimizer is a library component, so neither lifecycle event may leak a
+    # banner into the launchers' machine-readable streams.
+    optimizer.__setstate__(optimizer.__getstate__())
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def _tensor_bytes(model):
     return b"".join(
         tensor.detach().cpu().contiguous().numpy().tobytes()
