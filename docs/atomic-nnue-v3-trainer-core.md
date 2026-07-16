@@ -60,6 +60,23 @@ order. Its train and validation roles are disjoint and are validated
 independently before any model allocation. The fixture is forced to LF by
 `.gitattributes`, so the authenticated bytes do not change on Windows.
 
+The first 375-million-position pilot has a separate
+`atomic-v3-bootstrap-training-receipt-v1` boundary. It authenticates exactly 29
+ordered training manifests and one validation manifest, their semantic
+validation JSONL and the observed 6-thread/30-thread generation topology. The
+receipt is always `provenance_class=non-publication-bootstrap`, with both
+`dataset_publication_ready` and `release_candidate_eligible` exactly false.
+Those values are passed unchanged to the provider and cannot be promoted by a
+caller. The publication loader rejects a bootstrap receipt and the bootstrap
+loader rejects a publication receipt.
+
+`atomic_v3.dataset_source` exposes mutually exclusive publication/bootstrap
+API objects and CLI arguments. There is no content sniffing, auto-detection or
+fallback between them. The bootstrap route reauthenticates its externally
+pinned receipt, all 30 ordered manifest byte snapshots and the semantic JSONL
+on every provider creation. Manifest and shard path, digest and filesystem
+identity reuse across the 29+1 roles is rejected.
+
 The isolated backend remains import-compatible with CPython 3.9 through 3.12.
 Its runtime modules avoid PEP 604 unions and dataclass options introduced after
 3.9; CI compiles and imports every `atomic_v3` module at each supported minor.
