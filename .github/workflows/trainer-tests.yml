@@ -15,6 +15,34 @@ permissions:
   contents: read
 
 jobs:
+  atomic-v3-python-compatibility:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-CPU.txt
+
+      - name: Install isolated Atomic V3 import dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1+cpu
+          python -m pip install numpy==1.26.4
+
+      - name: Compile and import every Atomic V3 module
+        run: |
+          python -m compileall -q atomic_v3
+          python -c "import importlib, pkgutil, atomic_v3; modules = [item.name for item in pkgutil.iter_modules(atomic_v3.__path__, atomic_v3.__name__ + '.')]; [importlib.import_module(name) for name in modules]; print(len(modules), 'Atomic V3 modules imported')"
+
   cpu:
     timeout-minutes: 15
     strategy:

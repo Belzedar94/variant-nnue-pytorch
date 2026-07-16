@@ -1,0 +1,75 @@
+{
+  "fixture_schema": "atomic-v3-trainer-core-v1",
+  "feature_schema_sha256": "9d3c77a58e5e55ac1bc798dab41977451eb523fce1d6fd3ec3f7c1e574a78750",
+  "campaign_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "collection_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "roles": {
+    "train": [
+      {
+        "sample_id": "train-000",
+        "side_to_move": "WHITE",
+        "piece_count": 8,
+        "outcome": 1.0,
+        "score": 210,
+        "white": {
+          "own_king_square": 4,
+          "hm": [24452, 24323, 24192, 23820, 24572, 24443, 24312, 23924],
+          "capture_pair": [0, 5, 39984],
+          "king_blast_ep": [0, 17, 2303],
+          "blast_ring": [0, 159, 10239]
+        },
+        "black": {
+          "own_king_square": 60,
+          "hm": [24572, 24443, 24312, 23924, 24452, 24323, 24192, 23820],
+          "capture_pair": [6, 20000, 39998],
+          "king_blast_ep": [18, 35, 2268],
+          "blast_ring": [5, 320, 10000]
+        }
+      },
+      {
+        "sample_id": "train-001",
+        "side_to_move": "BLACK",
+        "piece_count": 16,
+        "outcome": 0.0,
+        "score": -175,
+        "white": {
+          "own_king_square": 1,
+          "hm": [22918, 22788, 22663, 22656, 22421, 22533, 22287, 22283, 23038, 22908, 22783, 22776, 22509, 22653, 22391, 22387],
+          "capture_pair": [84, 420, 39997],
+          "king_blast_ep": [216, 450],
+          "blast_ring": [640, 1280, 9000]
+        },
+        "black": {
+          "own_king_square": 57,
+          "hm": [23038, 22908, 22783, 22776, 22509, 22653, 22391, 22387, 22918, 22788, 22663, 22656, 22421, 22533, 22287, 22283],
+          "capture_pair": [980, 1876, 40011],
+          "king_blast_ep": [72, 900],
+          "blast_ring": [80, 2560, 8000]
+        }
+      }
+    ],
+    "validation": [
+      {
+        "sample_id": "validation-000",
+        "side_to_move": "WHITE",
+        "piece_count": 4,
+        "outcome": 0.5,
+        "score": -1,
+        "white": {
+          "own_king_square": 7,
+          "hm": [22151, 22030, 22271, 22134],
+          "capture_pair": [1, 39985],
+          "king_blast_ep": [1, 16],
+          "blast_ring": [1, 79]
+        },
+        "black": {
+          "own_king_square": 63,
+          "hm": [22271, 22134, 22151, 22030],
+          "capture_pair": [7, 39999],
+          "king_blast_ep": [19, 34],
+          "blast_ring": [6, 74]
+        }
+      }
+    ]
+  }
+}
