@@ -414,6 +414,7 @@ class StreamImpl {
         if (!hasDelivered)
             throw std::logic_error("Atomic V3 provider has no delivered batch to commit");
         committed = lastDelivered;
+        hasDelivered = false;
     }
 
     const AtomicV3ProviderCursorV1& committed_cursor() const noexcept { return committed; }
@@ -523,6 +524,8 @@ class StreamImpl {
                 throw std::invalid_argument("Atomic V3 resume cursor contract/binding mismatch");
             working = *resume;
         }
+        if (!cyclic && working.epoch != 0)
+            throw std::invalid_argument("Atomic V3 non-cyclic resume epoch must be zero");
         if (working.eof)
         {
             if (cyclic || working.manifestIndex != specs.size() || working.recordIndex != 0)

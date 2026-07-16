@@ -141,6 +141,28 @@ def test_training_stream_is_cyclic_and_resume_is_exact(atomic_v2_manifest):
     resumed.close()
 
 
+def test_skip_three_training_resume_restores_exact_selector_state(atomic_v2_manifest):
+    manifest = _repeat_fixture_records(atomic_v2_manifest, 64)
+    arguments = _arguments(manifest, role="train", batch_size=5, skipping=3)
+    arguments["manifest_records"] = [64]
+    provider = NativeAtomicV3Provider(**arguments)
+    next(provider)
+    provider.commit()
+    committed = provider.state_dict()
+
+    expected = next(provider)
+    provider.commit()
+    expected_cursor = provider.state_dict()
+    provider.close()
+
+    resumed = NativeAtomicV3Provider(**{**arguments, "resume_state": committed})
+    actual = next(resumed)
+    _assert_same_batch(expected, actual)
+    resumed.commit()
+    assert resumed.state_dict() == expected_cursor
+    resumed.close()
+
+
 def test_skip_three_is_deterministic_without_smart_filter(atomic_v2_manifest):
     arguments = _arguments(
         atomic_v2_manifest, role="train", batch_size=5, skipping=3
@@ -212,6 +234,26 @@ def test_provider_rejects_role_and_worker_contract(atomic_v2_manifest):
         provider.commit()
     with pytest.raises(RuntimeError, match="closed"):
         next(provider)
+
+
+def test_commit_requires_newly_delivered_microbatch(atomic_v2_manifest):
+    provider = NativeAtomicV3Provider(**_arguments(atomic_v2_manifest))
+    next(provider)
+    provider.commit()
+    with pytest.raises(NativeProviderError, match="no delivered batch"):
+        provider.commit()
+    with pytest.raises(RuntimeError, match="closed"):
+        provider.state_dict()
+
+
+def test_validation_resume_rejects_nonzero_selector_epoch(atomic_v2_manifest):
+    arguments = _arguments(atomic_v2_manifest, skipping=3)
+    provider = NativeAtomicV3Provider(**arguments)
+    forged = provider.state_dict()
+    provider.close()
+    forged["epoch"] = 1
+    with pytest.raises(NativeProviderError, match="non-cyclic resume epoch must be zero"):
+        NativeAtomicV3Provider(**{**arguments, "resume_state": forged})
 
 
 def test_role_defaults_preserve_historical_skip_policy(atomic_v2_manifest):

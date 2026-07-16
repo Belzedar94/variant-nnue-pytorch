@@ -195,7 +195,9 @@ def _bootstrap_fixture(tmp_path):
                 "stderr": "",
                 "stderr_sha256": hashlib.sha256(b"").hexdigest(),
                 "semantic_result": semantic,
-                "semantic_counters": copy.deepcopy(per_chunk_counters),
+                "semantic_counters": {
+                    key: int(value) for key, value in per_chunk_counters.items()
+                },
                 "inputs_unchanged": True,
             }
         )
@@ -486,6 +488,16 @@ def test_semantic_evidence_must_match_selected_manifest_and_thread_mapping(tmp_p
     _write_semantic_evidence(state)
     receipt_sha256 = _write_receipt(state)
     with pytest.raises(DatasetContractError, match="result 0 is not successful"):
+        bootstrap_dataset.inspect_bootstrap_roles(state["receipt_path"], receipt_sha256)
+
+
+@pytest.mark.parametrize("invalid", ["4000000", -1, True])
+def test_semantic_evidence_counters_are_non_negative_json_integers(tmp_path, invalid):
+    state = _bootstrap_fixture(tmp_path)
+    state["semantic_results"][0]["semantic_counters"]["side_to_move_wins"] = invalid
+    _write_semantic_evidence(state)
+    receipt_sha256 = _write_receipt(state)
+    with pytest.raises(DatasetContractError, match="must be a non-negative integer"):
         bootstrap_dataset.inspect_bootstrap_roles(state["receipt_path"], receipt_sha256)
 
 

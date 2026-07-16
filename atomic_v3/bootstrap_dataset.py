@@ -632,13 +632,19 @@ def _validate_semantic_jsonl(
             document.get("semantic_counters"),
             _SEMANTIC_COUNTER_KEYS,
         )
-        parsed = {
-            key: _require_uint_string(
-                f"semantic validation result {chunk_index}.semantic_counters.{key}",
-                counters[key],
-            )
-            for key in _SEMANTIC_COUNTER_KEYS
-        }
+        # The verifier keeps data-tools' stdout counters as decimal strings in
+        # ``semantic_result``, then emits its independently parsed counters as
+        # JSON integers.  Preserve that type boundary so the receipt consumer
+        # validates the verifier's real output rather than a lookalike fixture.
+        parsed: dict[str, int] = {}
+        for key in _SEMANTIC_COUNTER_KEYS:
+            value = counters[key]
+            if not _is_plain_int(value) or value < 0:
+                raise DatasetContractError(
+                    f"semantic validation result {chunk_index}.semantic_counters.{key} "
+                    "must be a non-negative integer"
+                )
+            parsed[key] = value
         if (
             parsed["side_to_move_wins"] + parsed["draws"] + parsed["side_to_move_losses"]
             != BOOTSTRAP_RECORDS_PER_MANIFEST
