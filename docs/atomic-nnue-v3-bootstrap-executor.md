@@ -38,6 +38,8 @@ one complete semantic canary batch per role, restores both cursors exactly to
 canonical zero, and records the model/cursor hashes in the checkpoint
 configuration. Per-microbatch execution performs only shape/sample-count
 checks; expensive board reconstruction never runs in the CUDA hot path.
+The historical physical microbatch remains fixed at 128; progress reporting
+does not change the accumulation contract.
 
 ## Checkpoints and final artifacts
 
@@ -49,6 +51,7 @@ checkpoint intact. The checkpoint binds:
 - bootstrap receipt, selection and semantic-evidence hashes;
 - all ordered 29 training and one validation manifest paths, hashes and counts;
 - trainer, engine-submodule and bootstrap-verifier commits;
+- the exact native provider DLL SHA-256 used to construct both streams;
 - shared initial-state identity, model, Ranger, StepLR, Python, NumPy, torch
   CPU/CUDA RNG states;
 - continuous provider logical cursor and cumulative counters.
@@ -69,6 +72,15 @@ the root `training-summary.json` are machine-readable.
 Checkpoint, dataset, and shared-initial-state roots may reside on different
 volumes. The expected production output root can therefore be
 `D:\NNUE training\Atomic-v2` without moving or rewriting dataset provenance.
+
+Every 32 committed optimizer steps, and again at validation, epoch checkpoint
+and completion boundaries, `status.json` is atomically replaced. It records
+epoch/global steps, accepted training and validation samples, lambda, learning
+rates, the committed native cursor, UTC timestamps, invocation throughput and
+ETA. Epoch checkpoint records also include train/validation losses. The hot
+path reads only integer counters and the committed native cursor; it never
+copies a loss tensor to the host or introduces a per-microbatch CUDA
+synchronization.
 
 ## Production CLI
 
@@ -91,10 +103,14 @@ python train_atomic_v3.py `
 ```
 
 Use `--run lambda-0` (or another run ID) instead of `--all-runs` for one
-network. `--resume` restores each unfinished run from its rolling checkpoint;
-already-complete runs are accepted only when their final receipt, network and
-checkpoint hashes all verify. `--dry-run` remains a receipt/config
-authentication command and never loads CUDA or the provider.
+network. An existing `last.ckpt` always requires `--resume`; without it the
+launcher fails before constructing a model or provider and leaves the
+checkpoint byte-for-byte untouched. With `--resume`, an existing checkpoint
+is restored, while an absent checkpoint starts a fresh run. A checkpoint made
+with a different provider DLL hash is rejected. Already-complete runs are
+accepted only when their final receipt, network and checkpoint hashes all
+verify. `--dry-run` remains a receipt/config authentication command and never
+loads CUDA or the provider.
 
 The launcher creates or loads one atomic `shared-initial-state.pt`, verifies
 its tensor-domain SHA-256, and supplies that exact state to every selected run.
@@ -106,12 +122,15 @@ native cursor, and restore creates and verifies a replacement stream before it
 destroys the old stream. Validation reset uses that same transactional restore
 to the authenticated zero cursor.
 
-## One-step GPU canary
+## Restore-and-continue GPU canary
 
 Before a 37-epoch launch, the standalone canary exercises the real provider,
 one exact 16,384-position forward/backward/optimizer step, rolling checkpoint,
-fresh provider/model restore, final serializer, strict checker and strict
-loader. It cannot call `run_production` and therefore cannot start an epoch:
+fresh provider/model restore, a second real optimizer step, a second rolling
+checkpoint, final serializer, strict checker and strict loader. It reapplies
+and verifies the frozen one-thread torch setting before both steps. The final
+committed cursor must report 32,768 accepted samples and batch sequence 256.
+It cannot call `run_production` and therefore cannot start an epoch:
 
 ```powershell
 python scripts\canary_atomic_v3_production.py `
@@ -126,4 +145,5 @@ python scripts\canary_atomic_v3_production.py `
 ```
 
 The work directory must be empty. Its `canary-result.json` contains all input,
-checkpoint, network and restored-cursor hashes.
+restore/final checkpoint, network, restored-cursor and final-cursor hashes and
+counters.

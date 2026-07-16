@@ -1,8 +1,9 @@
-"""One-step real GPU canary for the AtomicNNUEV3 production seam.
+"""Two-step restore-and-continue GPU canary for AtomicNNUEV3 production.
 
 This diagnostic intentionally does not call ``run_production`` and therefore
-cannot start a 37-epoch run.  It exercises one exact effective optimizer step,
-then the same checkpoint/restore and strict wire serializer used by production.
+cannot start a 37-epoch run. It checkpoints one exact effective optimizer step,
+restores into fresh state, executes the next step, checkpoints again, then uses
+the same strict wire serializer as production.
 """
 
 from __future__ import annotations
@@ -52,14 +53,38 @@ from atomic_v3.production import (
 from atomic_v3.serialization import check_nnue, read_nnue, save_nnue
 
 
-CANARY_FORMAT = "atomic-v3-real-gpu-one-step-canary-v1"
+CANARY_FORMAT = "atomic-v3-real-gpu-resume-canary-v2"
+
+
+def _set_frozen_threads() -> None:
+    threads = production_config("lambda-0").threads
+    torch.set_num_threads(threads)
+    if torch.get_num_threads() != threads:
+        raise RuntimeError("canary failed to apply the frozen torch thread count")
+
+
+def _run_canary_optimizer_step(prepared):
+    """Apply the frozen CPU-thread contract and execute one exact GPU step."""
+
+    _set_frozen_threads()
+    return train_epoch(
+        prepared.model,
+        prepared.optimizer,
+        prepared.training_provider,
+        lambda_value=0.0,
+        sample_budget=EFFECTIVE_BATCH_SIZE,
+        effective_batch_size=EFFECTIVE_BATCH_SIZE,
+        microbatch_size=MICROBATCH_SIZE,
+        require_full_microbatches=True,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run one 16,384-position GPU optimizer step, checkpoint/restore, "
-            "and V3 serialize/load without starting production epochs"
+            "a second resumed step and V3 serialize/load without starting "
+            "production epochs"
         )
     )
     parser.add_argument(
@@ -89,6 +114,7 @@ def _prepare(
     *,
     snapshot,
     provider_library: Path,
+    provider_sha256: str,
     shared: SharedInitialState,
     device: str,
 ):
@@ -107,6 +133,7 @@ def _prepare(
             provider_library=provider_library,
             device=device,
         ),
+        provider_library_sha256=provider_sha256,
         shared_initial_state=shared,
         device=device,
     )
@@ -118,6 +145,7 @@ def run_canary(arguments: argparse.Namespace) -> dict[str, object]:
     provider_library = Path(os.path.abspath(arguments.provider_library))
     if not provider_library.is_file():
         raise FileNotFoundError(f"provider library is not a file: {provider_library}")
+    provider_sha256 = sha256_file(provider_library)
     work_directory = Path(os.path.abspath(arguments.work_dir))
     if work_directory.exists() and any(work_directory.iterdir()):
         raise FileExistsError(f"canary work directory is not empty: {work_directory}")
@@ -135,6 +163,7 @@ def run_canary(arguments: argparse.Namespace) -> dict[str, object]:
         first = _prepare(
             snapshot=snapshot,
             provider_library=provider_library,
+            provider_sha256=provider_sha256,
             shared=shared,
             device=device,
         )
@@ -143,16 +172,7 @@ def run_canary(arguments: argparse.Namespace) -> dict[str, object]:
             dataset=DatasetBinding.from_bootstrap(snapshot),
             commits=CommitBinding(trainer_commit),
         )
-        metric = train_epoch(
-            first.model,
-            first.optimizer,
-            first.training_provider,
-            lambda_value=0.0,
-            sample_budget=EFFECTIVE_BATCH_SIZE,
-            effective_batch_size=EFFECTIVE_BATCH_SIZE,
-            microbatch_size=MICROBATCH_SIZE,
-            require_full_microbatches=True,
-        )
+        metric = _run_canary_optimizer_step(first)
         if metric.samples != EFFECTIVE_BATCH_SIZE or metric.steps != 1:
             raise RuntimeError("canary did not complete exactly one optimizer step")
         cursor = first.training_provider.logical_cursor_state()
@@ -181,13 +201,14 @@ def run_canary(arguments: argparse.Namespace) -> dict[str, object]:
                 binding,
             ),
         )
-        checkpoint_hash = checkpoint_sha256(checkpoint_path)
+        restore_checkpoint_hash = checkpoint_sha256(checkpoint_path)
         cleanup_prepared(first)
         first = None
 
         second = _prepare(
             snapshot=snapshot,
             provider_library=provider_library,
+            provider_sha256=provider_sha256,
             shared=shared,
             device=device,
         )
@@ -209,20 +230,51 @@ def run_canary(arguments: argparse.Namespace) -> dict[str, object]:
         if second.training_provider.logical_cursor_state() != cursor:
             raise RuntimeError("canary provider cursor changed on restore")
 
+        resumed_metric = _run_canary_optimizer_step(second)
+        if resumed_metric.samples != EFFECTIVE_BATCH_SIZE or resumed_metric.steps != 1:
+            raise RuntimeError("resumed canary did not complete exactly one optimizer step")
+        final_cursor = second.training_provider.logical_cursor_state()
+        expected_batches = 2 * EFFECTIVE_BATCH_SIZE // MICROBATCH_SIZE
+        if (
+            final_cursor.get("accepted_samples") != 2 * EFFECTIVE_BATCH_SIZE
+            or final_cursor.get("next_batch_sequence") != expected_batches
+        ):
+            raise RuntimeError("resumed canary cursor differs after the second step")
+        final_counters = TrainingCounters(
+            global_steps=2,
+            training_samples=2 * EFFECTIVE_BATCH_SIZE,
+            last_epoch_training_samples=EFFECTIVE_BATCH_SIZE,
+            last_train_loss=resumed_metric.mean_loss,
+            last_lambda=0.0,
+        )
+        checkpoint_path = save_last_checkpoint(
+            checkpoint_directory,
+            checkpoint_document(
+                second.model,
+                second.optimizer,
+                second.scheduler,
+                final_cursor,
+                final_counters,
+                second_binding,
+            ),
+        )
+        final_checkpoint_hash = checkpoint_sha256(checkpoint_path)
+
         description = json.dumps(
             {
                 "format": CANARY_FORMAT,
                 "trainer_commit": trainer_commit,
                 "receipt_sha256": snapshot.receipt_sha256,
                 "initial_state_sha256": shared.sha256,
-                "checkpoint_sha256": checkpoint_hash,
+                "restore_checkpoint_sha256": restore_checkpoint_hash,
+                "final_checkpoint_sha256": final_checkpoint_hash,
             },
             allow_nan=False,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("ascii")
-        network_path = work_directory / "atomic-v3-one-step-canary.nnue"
+        network_path = work_directory / "atomic-v3-resume-canary.nnue"
         metadata = save_nnue(network_path, second.model, description)
         with network_path.open("rb") as stream:
             checked = check_nnue(stream)
@@ -234,26 +286,29 @@ def run_canary(arguments: argparse.Namespace) -> dict[str, object]:
             "format": CANARY_FORMAT,
             "status": "passed",
             "training_started": False,
-            "optimizer_steps": 1,
-            "samples": metric.samples,
-            "mean_loss": metric.mean_loss,
+            "optimizer_steps": 2,
+            "samples": metric.samples + resumed_metric.samples,
+            "first_step_mean_loss": metric.mean_loss,
+            "resumed_step_mean_loss": resumed_metric.mean_loss,
             "device": device,
             "receipt_sha256": snapshot.receipt_sha256,
             "provider_library": {
                 "path": os.fspath(provider_library),
-                "sha256": sha256_file(provider_library),
+                "sha256": provider_sha256,
             },
             "shared_initial_state": shared_artifact,
             "checkpoint": {
                 "path": os.fspath(checkpoint_path),
-                "sha256": checkpoint_hash,
+                "sha256": final_checkpoint_hash,
             },
+            "restore_checkpoint_sha256": restore_checkpoint_hash,
             "network": {
                 "path": os.fspath(network_path),
                 "bytes": metadata.size,
                 "sha256": metadata.sha256.lower(),
             },
             "restored_cursor": cursor,
+            "final_cursor": final_cursor,
         }
         result_path = work_directory / "canary-result.json"
         result_path.write_text(

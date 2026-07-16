@@ -1,4 +1,5 @@
 import argparse
+import copy
 from dataclasses import replace
 import inspect
 from pathlib import Path
@@ -42,6 +43,7 @@ from atomic_v3.executor import (
     FINAL_LEARNING_RATE,
     MAIN_LEARNING_RATE,
     MICROBATCH_SIZE,
+    PROGRESS_INTERVAL_STEPS,
     ProviderBatch,
     RANGER_N_SMA_THRESHOLD,
     RUN_CONFIGS,
@@ -64,6 +66,7 @@ from atomic_v3.executor import (
 )
 from ranger import Ranger
 import train_atomic_v3
+import scripts.canary_atomic_v3_production as canary_module
 
 
 SHA_A = "a" * 64
@@ -325,6 +328,7 @@ def test_four_run_contract_and_inclusive_lambda_endpoints():
         document = config.to_document()
         assert document["microbatch_size"] == 128
         assert document["accumulation_steps"] == 128
+        assert document["progress_interval_steps"] == PROGRESS_INTERVAL_STEPS == 32
         assert document["training_steps_per_epoch"] == 1221
         assert document["training_samples_accepted_per_epoch"] == 20_004_864
         assert document["validation_batches_per_epoch"] == 62
@@ -360,6 +364,30 @@ def test_microbatches_are_weighted_to_the_exact_effective_batch():
     # -2 * mean([1, 1, 1, 3, 3]) = -3.6, followed by SGD(lr=1).
     assert model.weight.item() == pytest.approx(3.6)
     assert provider.logical_cursor_state()["accepted_samples"] == 5
+
+
+def test_training_heartbeat_observes_only_committed_step_counters():
+    model = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    provider = FakeProvider([(1, 1), (2, 2), (3, 3)], cap=2)
+    events = []
+    metrics = train_epoch(
+        model,
+        optimizer,
+        provider,
+        lambda_value=0.0,
+        sample_budget=10,
+        effective_batch_size=4,
+        microbatch_size=2,
+        loss_function=mse_loss,
+        progress_callback=lambda steps, samples, cursor: events.append(
+            (steps, samples, cursor)
+        ),
+        progress_interval_steps=2,
+    )
+    assert metrics.steps == 3
+    assert [(steps, samples) for steps, samples, _ in events] == [(2, 8), (3, 10)]
+    assert [cursor["accepted_samples"] for _, _, cursor in events] == [8, 10]
 
 
 class SparseModel(nn.Module):
@@ -587,6 +615,29 @@ def test_checkpoint_rejects_incompatible_config(tmp_path):
         load_last_checkpoint(tmp_path, incompatible)
 
 
+def test_checkpoint_resume_rejects_different_native_provider_dll(tmp_path, monkeypatch):
+    prepared, _ = _prepared_tiny_run(monkeypatch)
+    config = prepared.checkpoint_config_document()
+    assert config["execution_identity"]["provider_library_sha256"] == SHA_A
+    binding = _binding(tmp_path, config)
+    save_last_checkpoint(
+        tmp_path,
+        checkpoint_document(
+            prepared.model,
+            prepared.optimizer,
+            prepared.scheduler,
+            prepared.training_provider.logical_cursor_state(),
+            TrainingCounters(),
+            binding,
+        ),
+    )
+    changed_config = copy.deepcopy(config)
+    changed_config["execution_identity"]["provider_library_sha256"] = SHA_B
+    incompatible = replace(binding, config=changed_config)
+    with pytest.raises(CheckpointError, match="config is incompatible"):
+        load_last_checkpoint(tmp_path, incompatible)
+
+
 def test_dry_run_cli_validates_without_starting_training(tmp_path, monkeypatch):
     snapshot = _snapshot(tmp_path)
     monkeypatch.setattr(train_atomic_v3, "inspect_bootstrap_roles", lambda *_: snapshot)
@@ -667,6 +718,50 @@ def test_seed_training_repeats_python_numpy_torch_and_cuda_if_present():
     first = sample()
     seed_training(42)
     assert sample() == first
+
+
+def test_real_gpu_canary_applies_frozen_single_torch_thread():
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(max(2, previous))
+        canary_module._set_frozen_threads()
+        assert torch.get_num_threads() == 1
+    finally:
+        torch.set_num_threads(previous)
+
+
+def test_canary_step_wrapper_reapplies_threads_before_every_optimizer_step(
+    monkeypatch,
+):
+    events = []
+
+    class Prepared:
+        model = object()
+        optimizer = object()
+        training_provider = object()
+
+    monkeypatch.setattr(
+        canary_module, "_set_frozen_threads", lambda: events.append("threads")
+    )
+
+    def train(*args, **kwargs):
+        events.append(("train", args, kwargs))
+        return object()
+
+    monkeypatch.setattr(canary_module, "train_epoch", train)
+    canary_module._run_canary_optimizer_step(Prepared())
+    canary_module._run_canary_optimizer_step(Prepared())
+    assert [event if isinstance(event, str) else event[0] for event in events] == [
+        "threads",
+        "train",
+        "threads",
+        "train",
+    ]
+    for _, _, kwargs in (event for event in events if not isinstance(event, str)):
+        assert kwargs["sample_budget"] == EFFECTIVE_BATCH_SIZE
+        assert kwargs["effective_batch_size"] == EFFECTIVE_BATCH_SIZE
+        assert kwargs["microbatch_size"] == MICROBATCH_SIZE
+        assert kwargs["require_full_microbatches"] is True
 
 
 def test_production_optimizer_validates_ranger_threshold(monkeypatch):
@@ -769,6 +864,7 @@ def _prepared_tiny_run(monkeypatch, events=None):
         production_config("lambda-0"),
         training_factory,
         validation_factory,
+        provider_library_sha256=SHA_A,
         shared_initial_state=shared,
         device="cpu",
     )
@@ -798,6 +894,7 @@ def test_preparation_seeds_before_model_and_providers_and_loads_shared_init(monk
             role="validation",
             events=events,
         ),
+        provider_library_sha256=SHA_A,
         shared_initial_state=shared,
         device="cpu",
     )
@@ -847,6 +944,15 @@ def test_run_production_end_to_end_validates_complete_resume_without_gpu_full_ru
             binding,
         ),
     )
-    restored = run_production(prepared, binding, str(tmp_path), resume=True)
+    progress = []
+    restored = run_production(
+        prepared,
+        binding,
+        str(tmp_path),
+        resume=True,
+        progress_callback=progress.append,
+    )
     assert restored == counters
     assert prepared.training_provider.logical_cursor_state() == cursor
+    assert [event["event"] for event in progress] == ["run-ready", "run-complete"]
+    assert all(event["global_steps"] == counters.global_steps for event in progress)

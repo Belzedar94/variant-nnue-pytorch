@@ -9,11 +9,13 @@ alternate reader, optimizer, loss, or serializer path.
 from __future__ import annotations
 
 import gc
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Any, Mapping, Optional, Sequence
 
 import torch
@@ -257,6 +259,64 @@ def _write_status(run_directory: Path, document: Mapping[str, object]) -> None:
     _atomic_replace_bytes(run_directory / "status.json", _canonical_json_bytes(payload))
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_text(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class _ProgressReporter:
+    """Atomically persist low-frequency executor progress and an ETA."""
+
+    def __init__(self, run_directory: Path, run_id: str) -> None:
+        self.run_directory = run_directory
+        self.run_id = run_id
+        self.started_at = _utc_now()
+        self.started_monotonic = time.monotonic()
+        self.start_global_steps: Optional[int] = None
+        self.last_document: Optional[dict[str, object]] = None
+
+    def __call__(self, event: Mapping[str, object]) -> None:
+        if not isinstance(event, Mapping):
+            raise TypeError("progress event must be a mapping")
+        now = _utc_now()
+        elapsed = max(0.0, time.monotonic() - self.started_monotonic)
+        global_steps = event.get("global_steps")
+        total_steps = event.get("total_steps")
+        if isinstance(global_steps, bool) or not isinstance(global_steps, int):
+            raise ProductionLaunchError("progress global_steps is malformed")
+        if isinstance(total_steps, bool) or not isinstance(total_steps, int):
+            raise ProductionLaunchError("progress total_steps is malformed")
+        if global_steps < 0 or total_steps <= 0 or global_steps > total_steps:
+            raise ProductionLaunchError("progress step counters are outside bounds")
+        if self.start_global_steps is None:
+            self.start_global_steps = global_steps
+        delta_steps = global_steps - self.start_global_steps
+        steps_per_second: Optional[float] = None
+        eta_seconds: Optional[float] = None
+        estimated_completion: Optional[str] = None
+        if delta_steps > 0 and elapsed > 0.0:
+            steps_per_second = delta_steps / elapsed
+            eta_seconds = (total_steps - global_steps) / steps_per_second
+            estimated_completion = _utc_text(now + timedelta(seconds=eta_seconds))
+        document: dict[str, object] = {
+            **dict(event),
+            "status": "training" if event.get("phase") != "completed" else "trained",
+            "run_id": self.run_id,
+            "training_started": True,
+            "invocation_started_at_utc": _utc_text(self.started_at),
+            "updated_at_utc": _utc_text(now),
+            "elapsed_seconds_this_invocation": elapsed,
+            "steps_per_second_this_invocation": steps_per_second,
+            "estimated_remaining_seconds": eta_seconds,
+            "estimated_completion_utc": estimated_completion,
+        }
+        self.last_document = document
+        _write_status(self.run_directory, document)
+
+
 def _network_description(
     run_id: str,
     trainer_commit: str,
@@ -392,6 +452,7 @@ def execute_one_run(
     config = production_config(run_id)
     run_directory, network_path, receipt_path = _artifact_paths(output_root, run_id)
     run_directory.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = run_directory / "last.ckpt"
     if receipt_path.exists():
         if not resume:
             raise FileExistsError(f"final training receipt already exists: {receipt_path}")
@@ -412,10 +473,25 @@ def execute_one_run(
         raise FileExistsError(
             f"orphan final network exists without its receipt: {network_path}"
         )
+    if os.path.lexists(checkpoint_path) and not checkpoint_path.is_file():
+        raise FileExistsError(f"rolling checkpoint path is not a file: {checkpoint_path}")
+    checkpoint_exists = checkpoint_path.is_file()
+    if checkpoint_exists and not resume:
+        raise FileExistsError(
+            f"rolling checkpoint already exists; pass --resume: {checkpoint_path}"
+        )
+    resume_from_checkpoint = bool(resume and checkpoint_exists)
 
     _write_status(
         run_directory,
-        {"status": "preparing", "run_id": run_id, "training_started": False},
+        {
+            "status": "preparing",
+            "run_id": run_id,
+            "training_started": False,
+            "resume_requested": bool(resume),
+            "resume_from_checkpoint": resume_from_checkpoint,
+            "updated_at_utc": _utc_text(_utc_now()),
+        },
     )
     training_factory = _provider_factory(
         snapshot, "train", provider_library=provider_library, device=device
@@ -424,11 +500,13 @@ def execute_one_run(
         snapshot, "validation", provider_library=provider_library, device=device
     )
     prepared: Optional[PreparedProductionRun] = None
+    progress: Optional[_ProgressReporter] = None
     try:
         prepared = prepare_production_run(
             config,
             training_factory,
             validation_factory,
+            provider_library_sha256=provider_sha256,
             shared_initial_state=shared,
             device=device,
         )
@@ -437,16 +515,27 @@ def execute_one_run(
             dataset=DatasetBinding.from_bootstrap(snapshot),
             commits=CommitBinding(trainer_commit),
         )
+        progress = _ProgressReporter(run_directory, run_id)
         _write_status(
             run_directory,
-            {"status": "training", "run_id": run_id, "training_started": True},
+            {
+                "status": "training",
+                "run_id": run_id,
+                "training_started": True,
+                "resume_requested": bool(resume),
+                "resume_from_checkpoint": resume_from_checkpoint,
+                "updated_at_utc": _utc_text(_utc_now()),
+            },
         )
         counters = run_production(
-            prepared, binding, os.fspath(run_directory), resume=resume
+            prepared,
+            binding,
+            os.fspath(run_directory),
+            resume=resume_from_checkpoint,
+            progress_callback=progress,
         )
         if counters.completed_epochs != EPOCHS:
             raise ProductionLaunchError("production run ended before epoch 37")
-        checkpoint_path = run_directory / "last.ckpt"
         if not checkpoint_path.is_file():
             raise ProductionLaunchError("completed production run has no last.ckpt")
         description = _network_description(
@@ -507,6 +596,7 @@ def execute_one_run(
                 "training_started": True,
                 "receipt": os.fspath(receipt_path),
                 "network_sha256": network_sha256,
+                "updated_at_utc": _utc_text(_utc_now()),
             },
         )
         return receipt
@@ -518,6 +608,10 @@ def execute_one_run(
                 "run_id": run_id,
                 "error_type": type(error).__name__,
                 "error": str(error),
+                "updated_at_utc": _utc_text(_utc_now()),
+                "last_progress": (
+                    progress.last_document if progress is not None else None
+                ),
             },
         )
         raise

@@ -115,8 +115,10 @@ def test_one_run_calls_only_prepare_run_and_final_serializer(tmp_path, monkeypat
         events.append(("prepare", args, kwargs))
         return Prepared()
 
-    def run(prepared, binding, output_directory, *, resume):
-        events.append(("run", prepared, binding, output_directory, resume))
+    def run(prepared, binding, output_directory, *, resume, progress_callback):
+        events.append(
+            ("run", prepared, binding, output_directory, resume, progress_callback)
+        )
         Path(output_directory, "last.ckpt").write_bytes(b"checkpoint")
         return TrainingCounters(completed_epochs=37)
 
@@ -147,6 +149,9 @@ def test_one_run_calls_only_prepare_run_and_final_serializer(tmp_path, monkeypat
         resume=False,
     )
     assert [event[0] for event in events] == ["prepare", "run", "serialize"]
+    assert events[0][2]["provider_library_sha256"] == production.sha256_file(
+        provider_library
+    )
     assert result["completed_epoch"] == 37
     assert result["network"]["sha256"] == hashlib.sha256(
         b"strict-v3-final"
@@ -233,6 +238,146 @@ def test_failed_run_closes_provider_and_writes_machine_status(tmp_path, monkeypa
     )
     assert status["status"] == "failed"
     assert status["error_type"] == "RuntimeError"
+
+
+def test_existing_checkpoint_without_resume_fails_before_prepare_and_preserves_bytes(
+    tmp_path, monkeypatch
+):
+    snapshot = _snapshot(tmp_path)
+    provider_library = tmp_path / "provider.dll"
+    provider_library.write_bytes(b"provider")
+    output = tmp_path / "output"
+    checkpoint = output / "runs" / "lambda-0" / "last.ckpt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"advanced-checkpoint-must-survive")
+    calls = []
+    monkeypatch.setattr(
+        production,
+        "prepare_production_run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    with pytest.raises(FileExistsError, match="pass --resume"):
+        production.execute_one_run(
+            run_id="lambda-0",
+            snapshot=snapshot,
+            output_root=output,
+            provider_library=provider_library,
+            provider_sha256=production.sha256_file(provider_library),
+            trainer_commit=TRAINER_COMMIT,
+            shared=_shared(),
+            shared_artifact={
+                "path": str(tmp_path / "shared.pt"),
+                "bytes": 1,
+                "file_sha256": SHA_A,
+                "state_sha256": _shared().sha256,
+            },
+            device="cuda:0",
+            resume=False,
+        )
+    assert calls == []
+    assert checkpoint.read_bytes() == b"advanced-checkpoint-must-survive"
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_exists", "expected_resume"), ((False, False), (True, True))
+)
+def test_resume_starts_fresh_only_when_checkpoint_is_absent(
+    tmp_path, monkeypatch, checkpoint_exists, expected_resume
+):
+    snapshot = _snapshot(tmp_path)
+    provider_library = tmp_path / "provider.dll"
+    provider_library.write_bytes(b"provider")
+    output = tmp_path / "output"
+    run_directory = output / "runs" / "lambda-025"
+    run_directory.mkdir(parents=True)
+    if checkpoint_exists:
+        (run_directory / "last.ckpt").write_bytes(b"checkpoint")
+    shared = _shared()
+    provider = _CloseProbe()
+
+    class Prepared:
+        model = object()
+        training_provider = provider
+        optimizer = object()
+        scheduler = object()
+        validation_provider_factory = object()
+
+        def checkpoint_config_document(self):
+            return {"normative": True}
+
+    observed = []
+
+    def run(prepared, binding, output_directory, *, resume, progress_callback):
+        del prepared, binding, progress_callback
+        observed.append(resume)
+        Path(output_directory, "last.ckpt").write_bytes(b"completed-checkpoint")
+        return TrainingCounters(completed_epochs=37)
+
+    def serialize(path, model, description):
+        del model
+        payload = b"strict-v3-final"
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(payload)
+        return WireMetadata(
+            description=description,
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest().upper(),
+        )
+
+    monkeypatch.setattr(production, "prepare_production_run", lambda *a, **k: Prepared())
+    monkeypatch.setattr(production, "run_production", run)
+    monkeypatch.setattr(production, "save_nnue", serialize)
+    result = production.execute_one_run(
+        run_id="lambda-025",
+        snapshot=snapshot,
+        output_root=output,
+        provider_library=provider_library,
+        provider_sha256=production.sha256_file(provider_library),
+        trainer_commit=TRAINER_COMMIT,
+        shared=shared,
+        shared_artifact={
+            "path": str(tmp_path / "shared.pt"),
+            "bytes": 1,
+            "file_sha256": SHA_A,
+            "state_sha256": shared.sha256,
+        },
+        device="cuda:0",
+        resume=True,
+    )
+    assert result["completed_epoch"] == 37
+    assert observed == [expected_resume]
+    assert provider.closed
+
+
+def test_progress_reporter_persists_atomic_eta_and_checkpoint_payload(tmp_path):
+    reporter = production._ProgressReporter(tmp_path, "lambda-0")
+    reporter(
+        {
+            "event": "run-ready",
+            "phase": "training",
+            "global_steps": 10,
+            "total_steps": 100,
+        }
+    )
+    reporter.started_monotonic -= 32.0
+    reporter(
+        {
+            "event": "epoch-checkpoint",
+            "phase": "checkpointed",
+            "completed_epochs": 1,
+            "global_steps": 42,
+            "total_steps": 100,
+            "checkpoint": {"path": "D:/last.ckpt", "bytes": 123},
+        }
+    )
+    status = json.loads((tmp_path / "status.json").read_text(encoding="ascii"))
+    assert status["format"] == production.STATUS_FORMAT
+    assert status["event"] == "epoch-checkpoint"
+    assert status["checkpoint"]["bytes"] == 123
+    assert status["steps_per_second_this_invocation"] > 0
+    assert status["estimated_remaining_seconds"] > 0
+    assert status["estimated_completion_utc"].endswith("Z")
+    assert status["updated_at_utc"].endswith("Z")
 
 
 def test_execute_all_runs_reuses_one_shared_state_and_updates_summary(

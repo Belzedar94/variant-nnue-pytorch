@@ -60,6 +60,7 @@ RANGER_ALPHA = 0.5
 RANGER_K = 6
 RANGER_N_SMA_THRESHOLD = 5
 SCHEDULER_GAMMA = 0.987
+PROGRESS_INTERVAL_STEPS = 32
 
 
 class ExecutorError(ValueError):
@@ -79,6 +80,16 @@ def _finite_unit(label: str, value: object) -> float:
     if not math.isfinite(result) or not 0.0 <= result <= 1.0:
         raise ExecutorError(f"{label} must be finite and in [0, 1]")
     return result
+
+
+def _lower_sha256(label: str, value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ExecutorError(f"{label} must be lowercase SHA-256 hex")
+    return value
 
 
 @dataclass(frozen=True)
@@ -227,6 +238,7 @@ class ProductionRunConfig:
                 "step_size_epochs": 1,
                 "gamma": SCHEDULER_GAMMA,
             },
+            "progress_interval_steps": PROGRESS_INTERVAL_STEPS,
             "dataset": {
                 "source": "authenticated-bootstrap-receipt-only",
                 "provenance_class": "non-publication-bootstrap",
@@ -299,6 +311,8 @@ class ResumableBatchProvider(Protocol):
 
 LossFunction = Callable[[torch.nn.Module, object, float], torch.Tensor]
 ClipFunction = Callable[[], None]
+StepProgressCallback = Callable[[int, int, Mapping[str, object]], None]
+ProgressCallback = Callable[[Mapping[str, object]], None]
 
 
 _PROVIDER_CURSOR_KEYS = {
@@ -478,6 +492,7 @@ class PreparedProductionRun:
     training_start_cursor: Mapping[str, object]
     validation_start_cursor: Mapping[str, object]
     initial_state_sha256: str
+    provider_library_sha256: str
 
     def checkpoint_config_document(self) -> dict[str, object]:
         document = self.config.to_document()
@@ -489,6 +504,9 @@ class PreparedProductionRun:
             "validation_start_cursor_sha256": hashlib.sha256(
                 canonical_cursor_bytes(self.validation_start_cursor)
             ).hexdigest(),
+            "provider_library_sha256": _lower_sha256(
+                "provider library SHA-256", self.provider_library_sha256
+            ),
         }
         return document
 
@@ -504,6 +522,7 @@ def prepare_production_run(
     training_provider_factory: Callable[[], ResumableBatchProvider],
     validation_provider_factory: Callable[[], ResumableBatchProvider],
     *,
+    provider_library_sha256: str,
     shared_initial_state: Optional[SharedInitialState] = None,
     device: str = "cuda",
 ) -> PreparedProductionRun:
@@ -514,6 +533,9 @@ def prepare_production_run(
         validation_provider_factory
     ):
         raise TypeError("production provider factories must be callable")
+    provider_library_sha256 = _lower_sha256(
+        "provider library SHA-256", provider_library_sha256
+    )
 
     # This call deliberately precedes model construction and both provider
     # factories. Repeating prepare_production_run for each lambda therefore
@@ -562,6 +584,7 @@ def prepare_production_run(
         training_start_cursor=training_start,
         validation_start_cursor=validation_start,
         initial_state_sha256=initial_state.sha256,
+        provider_library_sha256=provider_library_sha256,
     )
 
 
@@ -750,6 +773,8 @@ def train_epoch(
     microbatch_size: int = MICROBATCH_SIZE,
     loss_function: LossFunction = _default_loss,
     require_full_microbatches: bool = False,
+    progress_callback: Optional[StepProgressCallback] = None,
+    progress_interval_steps: int = PROGRESS_INTERVAL_STEPS,
 ) -> EpochMetrics:
     """Train one exact sample budget with sample-weighted microbatches."""
 
@@ -763,6 +788,11 @@ def train_epoch(
         raise ExecutorError("microbatch size exceeds effective batch size")
     if not callable(loss_function):
         raise TypeError("loss_function must be callable")
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
+    progress_interval_steps = _positive_int(
+        "progress interval steps", progress_interval_steps
+    )
     clip = _clip_function(model)
     model.train()
     consumed = 0
@@ -796,6 +826,13 @@ def train_epoch(
         _commit_training_step(provider)
         consumed += step_samples
         steps += 1
+        if progress_callback is not None and (
+            steps % progress_interval_steps == 0 or consumed == sample_budget
+        ):
+            # This callback deliberately observes only the committed native
+            # cursor and integer counters. It performs no loss transfer or CUDA
+            # synchronization in the microbatch hot path.
+            progress_callback(steps, consumed, copy.deepcopy(_provider_cursor(provider)))
     return EpochMetrics(consumed, steps, _metric_mean(weighted_loss, consumed, "training"))
 
 
@@ -929,12 +966,24 @@ def validate_production_counters(
         raise ExecutorError("training cursor batch sequence differs from counters")
 
 
+def _emit_progress(
+    callback: Optional[ProgressCallback], document: Mapping[str, object]
+) -> None:
+    if callback is not None:
+        callback(dict(document))
+
+
+def _learning_rates(optimizer: torch.optim.Optimizer) -> list[float]:
+    return [float(group["lr"]) for group in optimizer.param_groups]
+
+
 def run_production(
     prepared: PreparedProductionRun,
     checkpoint_binding: CheckpointBinding,
     output_directory: str,
     *,
     resume: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> TrainingCounters:
     """Execute all remaining epochs, writing only rolling ``last.ckpt``.
 
@@ -945,6 +994,8 @@ def run_production(
 
     if not isinstance(prepared, PreparedProductionRun):
         raise TypeError("production execution requires PreparedProductionRun")
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
     config = prepared.config.validate()
     model = prepared.model
     optimizer = prepared.optimizer
@@ -981,8 +1032,52 @@ def run_production(
         )
     cursor = _provider_cursor(training_provider)
     validate_production_counters(config, counters, cursor)
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "run-ready",
+            "phase": "training",
+            "completed_epochs": counters.completed_epochs,
+            "current_epoch": min(counters.completed_epochs + 1, config.epochs),
+            "total_epochs": config.epochs,
+            "global_steps": counters.global_steps,
+            "total_steps": config.epochs * TRAINING_STEPS_PER_EPOCH,
+            "training_samples": counters.training_samples,
+            "validation_samples": counters.validation_samples,
+            "learning_rates": _learning_rates(optimizer),
+            "cursor": dict(cursor),
+            "resumed_from_checkpoint": bool(resume),
+        },
+    )
     for epoch_index in range(counters.completed_epochs, config.epochs):
         lambda_value = config.lambda_schedule.value(epoch_index)
+
+        def step_progress(
+            epoch_steps: int,
+            epoch_samples: int,
+            step_cursor: Mapping[str, object],
+        ) -> None:
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "heartbeat",
+                    "phase": "training",
+                    "completed_epochs": counters.completed_epochs,
+                    "current_epoch": epoch_index + 1,
+                    "total_epochs": config.epochs,
+                    "epoch_steps": epoch_steps,
+                    "steps_per_epoch": TRAINING_STEPS_PER_EPOCH,
+                    "global_steps": counters.global_steps + epoch_steps,
+                    "total_steps": config.epochs * TRAINING_STEPS_PER_EPOCH,
+                    "epoch_training_samples": epoch_samples,
+                    "training_samples": counters.training_samples + epoch_samples,
+                    "validation_samples": counters.validation_samples,
+                    "lambda": lambda_value,
+                    "learning_rates": _learning_rates(optimizer),
+                    "cursor": dict(step_cursor),
+                },
+            )
+
         training = train_epoch(
             model,
             optimizer,
@@ -992,6 +1087,27 @@ def run_production(
             effective_batch_size=config.effective_batch_size,
             microbatch_size=MICROBATCH_SIZE,
             require_full_microbatches=True,
+            progress_callback=step_progress,
+            progress_interval_steps=PROGRESS_INTERVAL_STEPS,
+        )
+
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "validation-start",
+                "phase": "validation",
+                "completed_epochs": counters.completed_epochs,
+                "current_epoch": epoch_index + 1,
+                "total_epochs": config.epochs,
+                "global_steps": counters.global_steps + training.steps,
+                "total_steps": config.epochs * TRAINING_STEPS_PER_EPOCH,
+                "training_samples": counters.training_samples + training.samples,
+                "validation_samples": counters.validation_samples,
+                "last_train_loss": training.mean_loss,
+                "lambda": lambda_value,
+                "learning_rates": _learning_rates(optimizer),
+                "cursor": dict(_provider_cursor(training_provider)),
+            },
         )
 
         # A fresh provider is used and force-restored to the same authenticated
@@ -1035,7 +1151,54 @@ def run_production(
         document = checkpoint_document(
             model, optimizer, scheduler, cursor, counters, checkpoint_binding
         )
-        save_last_checkpoint(output_directory, document)
+        checkpoint_path = save_last_checkpoint(output_directory, document)
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "epoch-checkpoint",
+                "phase": "checkpointed",
+                "completed_epochs": counters.completed_epochs,
+                "current_epoch": counters.completed_epochs,
+                "total_epochs": config.epochs,
+                "global_steps": counters.global_steps,
+                "total_steps": config.epochs * TRAINING_STEPS_PER_EPOCH,
+                "training_samples": counters.training_samples,
+                "validation_samples": counters.validation_samples,
+                "validation_batches": counters.validation_batches,
+                "last_epoch_training_samples": counters.last_epoch_training_samples,
+                "last_epoch_validation_samples": counters.last_epoch_validation_samples,
+                "last_epoch_validation_batches": counters.last_epoch_validation_batches,
+                "last_train_loss": counters.last_train_loss,
+                "last_validation_loss": counters.last_validation_loss,
+                "lambda": counters.last_lambda,
+                "learning_rates": _learning_rates(optimizer),
+                "cursor": dict(cursor),
+                "checkpoint": {
+                    "path": str(checkpoint_path.absolute()),
+                    "bytes": checkpoint_path.stat().st_size,
+                },
+            },
+        )
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "run-complete",
+            "phase": "completed",
+            "completed_epochs": counters.completed_epochs,
+            "current_epoch": counters.completed_epochs,
+            "total_epochs": config.epochs,
+            "global_steps": counters.global_steps,
+            "total_steps": config.epochs * TRAINING_STEPS_PER_EPOCH,
+            "training_samples": counters.training_samples,
+            "validation_samples": counters.validation_samples,
+            "validation_batches": counters.validation_batches,
+            "last_train_loss": counters.last_train_loss,
+            "last_validation_loss": counters.last_validation_loss,
+            "lambda": counters.last_lambda,
+            "learning_rates": _learning_rates(optimizer),
+            "cursor": dict(cursor),
+        },
+    )
     return counters
 
 
@@ -1051,7 +1214,9 @@ __all__ = [
     "MAIN_LEARNING_RATE",
     "MICROBATCH_SIZE",
     "PRECISION",
+    "PROGRESS_INTERVAL_STEPS",
     "PreparedProductionRun",
+    "ProgressCallback",
     "ProductionRunConfig",
     "ProviderBatch",
     "RANDOM_SKIP",
@@ -1059,6 +1224,7 @@ __all__ = [
     "RUN_CONFIGS",
     "ResumableBatchProvider",
     "SharedInitialState",
+    "StepProgressCallback",
     "SCHEDULER_GAMMA",
     "SEED",
     "THREADS",
