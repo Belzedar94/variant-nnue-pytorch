@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,8 +51,10 @@ _COUNTER_KEYS = {
     "global_steps",
     "training_samples",
     "validation_samples",
+    "validation_batches",
     "last_epoch_training_samples",
     "last_epoch_validation_samples",
+    "last_epoch_validation_batches",
     "last_train_loss",
     "last_validation_loss",
     "last_lambda",
@@ -239,25 +243,33 @@ class TrainingCounters:
     global_steps: int = 0
     training_samples: int = 0
     validation_samples: int = 0
+    validation_batches: int = 0
     last_epoch_training_samples: int = 0
     last_epoch_validation_samples: int = 0
+    last_epoch_validation_batches: int = 0
     last_train_loss: Optional[float] = None
     last_validation_loss: Optional[float] = None
     last_lambda: Optional[float] = None
 
     def to_document(self) -> dict[str, object]:
-        document = {
+        document: dict[str, object] = {
             "completed_epochs": _plain_uint("completed_epochs", self.completed_epochs),
             "global_steps": _plain_uint("global_steps", self.global_steps),
             "training_samples": _plain_uint("training_samples", self.training_samples),
             "validation_samples": _plain_uint(
                 "validation_samples", self.validation_samples
             ),
+            "validation_batches": _plain_uint(
+                "validation_batches", self.validation_batches
+            ),
             "last_epoch_training_samples": _plain_uint(
                 "last_epoch_training_samples", self.last_epoch_training_samples
             ),
             "last_epoch_validation_samples": _plain_uint(
                 "last_epoch_validation_samples", self.last_epoch_validation_samples
+            ),
+            "last_epoch_validation_batches": _plain_uint(
+                "last_epoch_validation_batches", self.last_epoch_validation_batches
             ),
             "last_train_loss": self.last_train_loss,
             "last_validation_loss": self.last_validation_loss,
@@ -307,6 +319,50 @@ def capture_rng_state() -> dict[str, object]:
             else []
         ),
     }
+
+
+def _plain_cursor_value(value: object, label: str) -> object:
+    """Return the exact JSON-domain cursor value or fail closed.
+
+    Provider cursors are persisted protocol state, not arbitrary Python pickle
+    payloads.  Keeping them in this deliberately small domain makes restore
+    comparison field-exact and stable across process boundaries.
+    """
+
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    if isinstance(value, list):
+        return [
+            _plain_cursor_value(item, f"{label}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise CheckpointError(f"{label} keys must be strings")
+            if key in result:
+                raise CheckpointError(f"{label} contains a duplicate key")
+            result[key] = _plain_cursor_value(item, f"{label}.{key}")
+        return result
+    raise CheckpointError(f"{label} escapes the frozen JSON cursor domain")
+
+
+def canonical_cursor_bytes(value: object) -> bytes:
+    if not isinstance(value, Mapping):
+        raise CheckpointError("logical cursor must be a mapping")
+    plain = _plain_cursor_value(value, "logical cursor")
+    return json.dumps(
+        plain,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
 
 
 def _validate_rng_state(value: object) -> Mapping[str, object]:
@@ -440,6 +496,7 @@ def checkpoint_document(
         raise TypeError("checkpoint optimizer must be a torch optimizer")
     if not isinstance(logical_cursor, Mapping):
         raise TypeError("logical cursor must be a mapping")
+    canonical_cursor_bytes(logical_cursor)
     document = {
         "checkpoint_format": CHECKPOINT_FORMAT,
         "backend": BACKEND_KEY,
@@ -479,6 +536,7 @@ def validate_checkpoint_document(value: object) -> dict[str, object]:
     ):
         if not isinstance(value[field], Mapping):
             raise CheckpointError(f"checkpoint {field} must be a mapping")
+    canonical_cursor_bytes(value["logical_cursor"])
     _validate_dataset_document(value["dataset"])
     _validate_commit_document(value["commits"])
     TrainingCounters.from_document(value["counters"])
@@ -548,7 +606,13 @@ def restore_checkpoint(
     restore = getattr(provider, "restore_logical_cursor", None)
     if not callable(restore):
         raise TypeError("provider must implement restore_logical_cursor")
+    expected_cursor = canonical_cursor_bytes(validated["logical_cursor"])
     restore(validated["logical_cursor"])
+    current = getattr(provider, "logical_cursor_state", None)
+    if not callable(current):
+        raise TypeError("provider must implement logical_cursor_state")
+    if canonical_cursor_bytes(current()) != expected_cursor:
+        raise CheckpointError("provider did not restore the checkpoint cursor exactly")
     restore_rng_state(validated["rng_state"])
     return TrainingCounters.from_document(validated["counters"])
 
@@ -571,6 +635,7 @@ __all__ = [
     "DatasetBinding",
     "TrainingCounters",
     "capture_rng_state",
+    "canonical_cursor_bytes",
     "checkpoint_document",
     "checkpoint_sha256",
     "load_last_checkpoint",

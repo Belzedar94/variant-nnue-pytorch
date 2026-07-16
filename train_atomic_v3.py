@@ -2,8 +2,11 @@
 
 The native provider and final NNUE serializer are intentionally not selected
 by this Slice2 entry point.  Real execution is exposed through
+``atomic_v3.executor.prepare_production_run`` followed by
 ``atomic_v3.executor.run_production`` once those audited dependencies are
-injected; this CLI is fail-closed and dry-run-only.
+injected.  Preparation seeds before constructing the model/providers and can
+load one shared initial state for all four runs; this CLI remains fail-closed
+and dry-run-only.
 """
 
 from __future__ import annotations

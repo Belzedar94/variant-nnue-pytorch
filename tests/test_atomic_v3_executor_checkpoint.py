@@ -1,5 +1,6 @@
 import argparse
 from dataclasses import replace
+import inspect
 from pathlib import Path
 import random
 
@@ -9,6 +10,7 @@ import torch
 from torch import nn
 
 import atomic_v3.checkpoint as checkpoint_module
+import atomic_v3.executor as executor_module
 from atomic_v3.bootstrap_dataset import (
     BOOTSTRAP_PROVENANCE_CLASS,
     BOOTSTRAP_RECORDS_PER_MANIFEST,
@@ -25,8 +27,15 @@ from atomic_v3.checkpoint import (
     restore_checkpoint,
     save_last_checkpoint,
 )
-from atomic_v3.dataset import RoleManifest
+from atomic_v3.dataset import (
+    AtomicV3Batch,
+    PerspectiveBatch,
+    RoleManifest,
+    SparseSliceBatch,
+    load_canonical_fixture,
+)
 from atomic_v3.executor import (
+    ACCUMULATION_STEPS,
     EFFECTIVE_BATCH_SIZE,
     EPOCHS,
     EPOCH_SIZE,
@@ -34,16 +43,24 @@ from atomic_v3.executor import (
     MAIN_LEARNING_RATE,
     MICROBATCH_SIZE,
     ProviderBatch,
+    RANGER_N_SMA_THRESHOLD,
     RUN_CONFIGS,
+    SharedInitialState,
     TRAINING_SAMPLES_PER_EPOCH,
     TRAINING_STEPS_PER_EPOCH,
     VALIDATION_SIZE,
     VALIDATION_BATCHES_PER_EPOCH,
     VALIDATION_SAMPLES_PER_EPOCH,
+    create_production_optimizer,
     densify_sparse_gradients,
+    prepare_production_run,
     production_config,
     reset_validation_provider,
+    run_production,
+    seed_training,
     train_epoch,
+    validate_production_counters,
+    validate_production_optimizer,
 )
 from ranger import Ranger
 import train_atomic_v3
@@ -54,10 +71,18 @@ SHA_B = "b" * 64
 
 
 class FakeProvider:
-    def __init__(self, records, *, cap=10_000):
+    def __init__(self, records, *, cap=10_000, role="train"):
         self.records = tuple((float(x), float(y)) for x, y in records)
         self.cap = cap
+        self.role = role
+        self.batch_size = 128
+        self.random_fen_skipping = 3
+        self.seed = 42
+        self.native_workers = 1
+        self.cyclic = role == "train"
+        self.binding_sha256 = ("a" if role == "train" else "b") * 64
         self.cursor = 0
+        self.batch_sequence = 0
 
     def next_batch(self, maximum_samples):
         count = min(maximum_samples, self.cap)
@@ -66,19 +91,105 @@ class FakeProvider:
             for offset in range(count)
         ]
         self.cursor += count
+        self.batch_sequence += 1
         x = torch.tensor([[item[0]] for item in selected], dtype=torch.float32)
         y = torch.tensor([[item[1]] for item in selected], dtype=torch.float32)
         return ProviderBatch((x, y), count)
 
     def logical_cursor_state(self):
-        return {"cursor": self.cursor, "seed": 42, "cyclic": True}
+        return {
+            "provider": "atomic-v3-sequential-v1",
+            "binding_sha256": self.binding_sha256,
+            "epoch": 0,
+            "manifest_index": 0,
+            "record_index": self.cursor,
+            "accepted_samples": self.cursor,
+            "next_batch_sequence": self.batch_sequence,
+            "eof": False,
+        }
 
     def restore_logical_cursor(self, state):
-        if set(state) != {"cursor", "seed", "cyclic"}:
+        if set(state) != {
+            "provider",
+            "binding_sha256",
+            "epoch",
+            "manifest_index",
+            "record_index",
+            "accepted_samples",
+            "next_batch_sequence",
+            "eof",
+        }:
             raise ValueError("bad fake cursor")
-        if state["seed"] != 42 or state["cyclic"] is not True:
+        if state["provider"] != "atomic-v3-sequential-v1":
             raise ValueError("bad fake cursor identity")
-        self.cursor = int(state["cursor"])
+        self.binding_sha256 = str(state["binding_sha256"])
+        self.cursor = int(state["accepted_samples"])
+        self.batch_sequence = int(state["next_batch_sequence"])
+
+    def commit(self):
+        pass
+
+
+def _repeat_batch(batch, copies=64):
+    def repeat(tensor):
+        return tensor.repeat((copies,) + (1,) * (tensor.ndim - 1))
+
+    def sparse(value):
+        return SparseSliceBatch(repeat(value.indices), repeat(value.values))
+
+    def perspective(value):
+        return PerspectiveBatch(
+            repeat(value.own_king_squares),
+            sparse(value.hm),
+            sparse(value.capture_pair),
+            sparse(value.king_blast_ep),
+            sparse(value.blast_ring),
+        )
+
+    return AtomicV3Batch(
+        repeat(batch.side_to_move_white),
+        repeat(batch.piece_counts),
+        perspective(batch.white),
+        perspective(batch.black),
+        repeat(batch.outcome),
+        repeat(batch.score),
+        repeat(batch.bucket_indices),
+    )
+
+
+class CanaryProvider(FakeProvider):
+    def __init__(self, payload, *, role, events=None):
+        super().__init__([(0, 0)], role=role)
+        self.payload = payload
+        self.closed = False
+        if events is not None:
+            events.append(role)
+
+    def next_batch(self, maximum_samples):
+        samples = self.payload.batch_size
+        assert samples <= maximum_samples
+        self.cursor += samples
+        self.batch_sequence += 1
+        return ProviderBatch(self.payload, samples)
+
+    def close(self):
+        self.closed = True
+
+
+class TinyNetwork(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc0 = nn.Linear(1, 2)
+        self.fc2 = nn.Linear(2, 1)
+
+
+class TinyAtomicModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.network = TinyNetwork()
+
+    def clip_weights(self):
+        pass
 
 
 def mse_loss(model, payload, lambda_value):
@@ -248,7 +359,7 @@ def test_microbatches_are_weighted_to_the_exact_effective_batch():
     assert metrics.mean_loss == pytest.approx(4.2)
     # -2 * mean([1, 1, 1, 3, 3]) = -3.6, followed by SGD(lr=1).
     assert model.weight.item() == pytest.approx(3.6)
-    assert provider.logical_cursor_state()["cursor"] == 5
+    assert provider.logical_cursor_state()["accepted_samples"] == 5
 
 
 class SparseModel(nn.Module):
@@ -280,6 +391,9 @@ class SparseProvider:
 
     def restore_logical_cursor(self, state):
         self.cursor = int(state["cursor"])
+
+    def commit(self):
+        pass
 
 
 class DenseCheckingSGD(torch.optim.SGD):
@@ -319,17 +433,17 @@ def test_validation_provider_resets_to_identical_fixed_cursor_each_epoch():
     created = []
 
     def factory():
-        provider = FakeProvider([(1, 1), (2, 2)])
-        provider.cursor = 99 + len(created)
+        provider = FakeProvider([(1, 1), (2, 2)], role="validation")
         created.append(provider)
         return provider
 
-    start = {"cursor": 0, "seed": 42, "cyclic": True}
-    first = reset_validation_provider(factory, start)
+    start = factory().logical_cursor_state()
+    created.clear()
+    first = reset_validation_provider(factory, start, production_config("lambda-0"))
     first.next_batch(3)
-    second = reset_validation_provider(factory, start)
+    second = reset_validation_provider(factory, start, production_config("lambda-0"))
     assert first is not second
-    assert first.logical_cursor_state()["cursor"] == 3
+    assert first.logical_cursor_state()["accepted_samples"] == 3
     assert second.logical_cursor_state() == start
 
 
@@ -516,3 +630,223 @@ def test_cli_refuses_non_dry_execution_before_touching_dataset():
 def test_cli_rejects_non_historical_bootstrap_microbatch():
     with pytest.raises(argparse.ArgumentTypeError, match="exactly 128"):
         train_atomic_v3._positive_microbatch("2048")
+
+
+def test_skip_three_and_full_historical_ranger_are_frozen():
+    document = production_config("lambda-025").to_document()
+    assert document["random_skip"] == 3
+    assert document["validation_random_skip"] == 3
+    assert document["dataset"]["training_random_skip"] == 3
+    assert document["dataset"]["validation_random_skip"] == 3
+    assert document["optimizer"]["n_sma_threshold"] == 5
+
+
+def test_default_hot_loss_disables_semantic_validation(monkeypatch):
+    monkeypatch.setattr(executor_module, "AtomicNNUEV3", TinyAtomicModel)
+    calls = []
+
+    def frozen_loss(model, payload, *, lambda_, validate):
+        calls.append((model, payload, lambda_, validate))
+        return torch.tensor(0.25)
+
+    monkeypatch.setattr(executor_module, "batch_loss", frozen_loss)
+    model = TinyAtomicModel()
+    payload = load_canonical_fixture().batch("train")
+    assert float(executor_module._default_loss(model, payload, 0.5)) == 0.25
+    assert calls == [(model, payload, 0.5, False)]
+    assert "loss_function" not in inspect.signature(run_production).parameters
+
+
+def test_seed_training_repeats_python_numpy_torch_and_cuda_if_present():
+    def sample():
+        values = (random.random(), float(np.random.random()), float(torch.rand(())))
+        cuda = float(torch.rand((), device="cuda")) if torch.cuda.is_available() else None
+        return values, cuda
+
+    seed_training(42)
+    first = sample()
+    seed_training(42)
+    assert sample() == first
+
+
+def test_production_optimizer_validates_ranger_threshold(monkeypatch):
+    monkeypatch.setattr(executor_module, "AtomicNNUEV3", TinyAtomicModel)
+    model = TinyAtomicModel()
+    optimizer, scheduler = create_production_optimizer(model)
+    validate_production_optimizer(
+        model, optimizer, scheduler, completed_epochs=0
+    )
+    assert optimizer.N_sma_threshold == RANGER_N_SMA_THRESHOLD == 5
+    optimizer.N_sma_threshold = 4
+    with pytest.raises(executor_module.ExecutorError, match="N_sma_threshold"):
+        validate_production_optimizer(
+            model, optimizer, scheduler, completed_epochs=0
+        )
+
+
+def test_counter_algebra_rejects_epoch_skips():
+    config = production_config("lambda-0")
+    cursor = CanaryProvider(
+        load_canonical_fixture().batch("train"), role="train"
+    ).logical_cursor_state()
+    validate_production_counters(config, TrainingCounters(), cursor)
+
+    impossible = TrainingCounters(completed_epochs=36, last_lambda=0.0)
+    with pytest.raises(executor_module.ExecutorError, match="global_steps"):
+        validate_production_counters(config, impossible, cursor)
+
+    one_epoch = TrainingCounters(
+        completed_epochs=1,
+        global_steps=TRAINING_STEPS_PER_EPOCH,
+        training_samples=TRAINING_SAMPLES_PER_EPOCH,
+        validation_samples=VALIDATION_SAMPLES_PER_EPOCH,
+        validation_batches=VALIDATION_BATCHES_PER_EPOCH,
+        last_epoch_training_samples=TRAINING_SAMPLES_PER_EPOCH,
+        last_epoch_validation_samples=VALIDATION_SAMPLES_PER_EPOCH,
+        last_epoch_validation_batches=VALIDATION_BATCHES_PER_EPOCH,
+        last_train_loss=0.2,
+        last_validation_loss=0.3,
+        last_lambda=0.0,
+    )
+    cursor = dict(cursor)
+    cursor["accepted_samples"] = TRAINING_SAMPLES_PER_EPOCH
+    cursor["next_batch_sequence"] = TRAINING_STEPS_PER_EPOCH * ACCUMULATION_STEPS
+    validate_production_counters(config, one_epoch, cursor)
+
+
+def test_restore_rejects_provider_that_ignores_checkpoint_cursor(tmp_path):
+    class BrokenRestoreProvider(FakeProvider):
+        def restore_logical_cursor(self, state):
+            del state
+
+    binding = _binding(tmp_path)
+    model, optimizer, scheduler = _tiny_components()
+    source = FakeProvider([(1, 1)])
+    source.next_batch(1)
+    document = checkpoint_document(
+        model,
+        optimizer,
+        scheduler,
+        source.logical_cursor_state(),
+        TrainingCounters(),
+        binding,
+    )
+    broken = BrokenRestoreProvider([(1, 1)])
+    with pytest.raises(CheckpointError, match="restore the checkpoint cursor exactly"):
+        restore_checkpoint(document, model, optimizer, scheduler, broken)
+
+
+def _prepared_tiny_run(monkeypatch, events=None):
+    fixture = _repeat_batch(load_canonical_fixture().batch("train"))
+
+    class LoggedTinyAtomicModel(TinyAtomicModel):
+        def __init__(self):
+            if events is not None:
+                events.append("model")
+            super().__init__()
+
+    monkeypatch.setattr(executor_module, "AtomicNNUEV3", LoggedTinyAtomicModel)
+    real_seed = executor_module.seed_training
+
+    def logged_seed(seed):
+        if events is not None:
+            events.append("seed")
+        real_seed(seed)
+
+    monkeypatch.setattr(executor_module, "seed_training", logged_seed)
+    logged_seed(42)
+    shared = SharedInitialState.from_model(LoggedTinyAtomicModel())
+    if events is not None:
+        events.clear()
+
+    def training_factory():
+        return CanaryProvider(fixture, role="train", events=events)
+
+    def validation_factory():
+        return CanaryProvider(fixture, role="validation", events=events)
+
+    prepared = prepare_production_run(
+        production_config("lambda-0"),
+        training_factory,
+        validation_factory,
+        shared_initial_state=shared,
+        device="cpu",
+    )
+    return prepared, shared
+
+
+def test_preparation_seeds_before_model_and_providers_and_loads_shared_init(monkeypatch):
+    events = []
+    first, shared = _prepared_tiny_run(monkeypatch, events)
+    assert events[:4] == ["seed", "model", "train", "validation"]
+    assert first.initial_state_sha256 == shared.sha256
+    assert first.training_start_cursor["accepted_samples"] == 0
+    assert first.validation_start_cursor["accepted_samples"] == 0
+    identity = first.checkpoint_config_document()["execution_identity"]
+    assert identity["initial_state_sha256"] == shared.sha256
+
+    events.clear()
+    second = prepare_production_run(
+        production_config("lambda-0"),
+        lambda: CanaryProvider(
+            _repeat_batch(load_canonical_fixture().batch("train")),
+            role="train",
+            events=events,
+        ),
+        lambda: CanaryProvider(
+            _repeat_batch(load_canonical_fixture().batch("train")),
+            role="validation",
+            events=events,
+        ),
+        shared_initial_state=shared,
+        device="cpu",
+    )
+    assert events[:4] == ["seed", "model", "train", "validation"]
+    assert second.initial_state_sha256 == first.initial_state_sha256
+
+
+def test_run_production_end_to_end_validates_complete_resume_without_gpu_full_run(
+    tmp_path, monkeypatch
+):
+    prepared, _ = _prepared_tiny_run(monkeypatch)
+    monkeypatch.setattr(executor_module, "require_production_model", lambda model: None)
+    source_model = type(prepared.model)()
+    source_model.load_state_dict(prepared.model.state_dict(), strict=True)
+    source_optimizer, source_scheduler = create_production_optimizer(source_model)
+    for _ in range(EPOCHS):
+        source_optimizer.step()
+        source_scheduler.step()
+    counters = TrainingCounters(
+        completed_epochs=EPOCHS,
+        global_steps=EPOCHS * TRAINING_STEPS_PER_EPOCH,
+        training_samples=EPOCHS * TRAINING_SAMPLES_PER_EPOCH,
+        validation_samples=EPOCHS * VALIDATION_SAMPLES_PER_EPOCH,
+        validation_batches=EPOCHS * VALIDATION_BATCHES_PER_EPOCH,
+        last_epoch_training_samples=TRAINING_SAMPLES_PER_EPOCH,
+        last_epoch_validation_samples=VALIDATION_SAMPLES_PER_EPOCH,
+        last_epoch_validation_batches=VALIDATION_BATCHES_PER_EPOCH,
+        last_train_loss=0.2,
+        last_validation_loss=0.3,
+        last_lambda=0.0,
+    )
+    cursor = dict(prepared.training_start_cursor)
+    cursor["accepted_samples"] = counters.training_samples
+    cursor["record_index"] = counters.training_samples
+    cursor["next_batch_sequence"] = (
+        EPOCHS * TRAINING_STEPS_PER_EPOCH * ACCUMULATION_STEPS
+    )
+    binding = _binding(tmp_path, prepared.checkpoint_config_document())
+    save_last_checkpoint(
+        tmp_path,
+        checkpoint_document(
+            source_model,
+            source_optimizer,
+            source_scheduler,
+            cursor,
+            counters,
+            binding,
+        ),
+    )
+    restored = run_production(prepared, binding, str(tmp_path), resume=True)
+    assert restored == counters
+    assert prepared.training_provider.logical_cursor_state() == cursor

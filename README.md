@@ -80,6 +80,9 @@ The isolated AtomicNNUEV3 bootstrap executor is currently dry-run-only until
 its audited native provider is injected. Its four frozen configurations,
 historical Ranger schedule and rolling checkpoint contract are documented in
 [docs/atomic-nnue-v3-bootstrap-executor.md](docs/atomic-nnue-v3-bootstrap-executor.md).
+The normative execution API first calls `prepare_production_run`; direct
+construction of a model/provider is not accepted by `run_production`. One
+`create_shared_initial_state()` result can be loaded by all four lambda runs.
 
 ## License of the native loader
 
@@ -102,9 +105,10 @@ Training and validation inputs must be different files. The escape hatch
 must not be used for real training or model comparison.
 
 The same seed controls model initialization and native random skipping. Native
-batch order is stable across worker counts; validation never applies random
-skipping, even when training does, and restarts from the beginning of its
-dedicated file for every validation pass.
+batch order is stable across worker counts. Legacy training retains its
+zero-skip validation behavior. The isolated AtomicNNUEV3 bootstrap instead
+freezes skip 3 for both roles and resets validation to the same accepted prefix
+of its dedicated chunk on every pass.
 
 For Legacy `.bin` input, smart FEN skipping retains the trainer's historical
 heuristic: positions with a teacher capture (including en passant) or a
