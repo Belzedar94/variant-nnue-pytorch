@@ -85,15 +85,11 @@ class Ranger(Optimizer):
         # level of gradient centralization
         #self.gc_gradient_threshold = 3 if gc_conv_only else 1
 
-        print(
-            f"Ranger optimizer loaded. \nGradient Centralization usage = {self.use_gc}")
-        if (self.use_gc and self.gc_conv_only == False):
-            print(f"GC applied to both conv and fc layers")
-        elif (self.use_gc and self.gc_conv_only == True):
-            print(f"GC applied to conv layers only")
+        # Optimizers are library components and must not write banners to
+        # stdout or stderr.  In particular, the Atomic V3 launchers reserve
+        # stdout for their single machine-readable JSON result.
 
     def __setstate__(self, state):
-        print("set state called")
         super(Ranger, self).__setstate__(state)
 
     def step(self, closure=None):
@@ -121,7 +117,6 @@ class Ranger(Optimizer):
                 if len(state) == 0:  # if first time to run...init dictionary with our desired entries
                     # if self.first_run_check==0:
                     # self.first_run_check=1
-                    #print("Initializing slow buffer...should not see this at load from saved model!")
                     state['step'] = 0
                     state['exp_avg'] = torch.zeros_like(p_data_fp32)
                     state['exp_avg_sq'] = torch.zeros_like(p_data_fp32)

@@ -76,6 +76,15 @@ python train.py train.atbin.manifest.json val.atbin.manifest.json
 See [docs/atomic-bin-v2.md](docs/atomic-bin-v2.md) for the pinned reader,
 schema and generator-policy contract.
 
+The isolated AtomicNNUEV3 bootstrap executor has an authenticated production
+CLI backed by the native provider and strict V3 serializer. Its four frozen
+configurations, historical Ranger schedule, shared seed-42 initialization,
+rolling checkpoint contract and final artifact receipts are documented in
+[docs/atomic-nnue-v3-bootstrap-executor.md](docs/atomic-nnue-v3-bootstrap-executor.md).
+The normative execution API first calls `prepare_production_run`; direct
+construction of a model/provider is not accepted by `run_production`. One
+atomically persisted shared initial state is loaded by all four lambda runs.
+
 ## License of the native loader
 
 `training_data_loader` statically links selected source files from
@@ -97,9 +106,10 @@ Training and validation inputs must be different files. The escape hatch
 must not be used for real training or model comparison.
 
 The same seed controls model initialization and native random skipping. Native
-batch order is stable across worker counts; validation never applies random
-skipping, even when training does, and restarts from the beginning of its
-dedicated file for every validation pass.
+batch order is stable across worker counts. Legacy training retains its
+zero-skip validation behavior. The isolated AtomicNNUEV3 bootstrap instead
+freezes skip 3 for both roles and resets validation to the same accepted prefix
+of its dedicated chunk on every pass.
 
 For Legacy `.bin` input, smart FEN skipping retains the trainer's historical
 heuristic: positions with a teacher capture (including en passant) or a

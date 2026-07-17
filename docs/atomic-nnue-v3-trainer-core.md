@@ -60,6 +60,23 @@ order. Its train and validation roles are disjoint and are validated
 independently before any model allocation. The fixture is forced to LF by
 `.gitattributes`, so the authenticated bytes do not change on Windows.
 
+The first 375-million-position pilot has a separate
+`atomic-v3-bootstrap-training-receipt-v1` boundary. It authenticates exactly 29
+ordered training manifests and one validation manifest, their semantic
+validation JSONL and the observed 6-thread/30-thread generation topology. The
+receipt is always `provenance_class=non-publication-bootstrap`, with both
+`dataset_publication_ready` and `release_candidate_eligible` exactly false.
+Those values are passed unchanged to the provider and cannot be promoted by a
+caller. The publication loader rejects a bootstrap receipt and the bootstrap
+loader rejects a publication receipt.
+
+`atomic_v3.dataset_source` exposes mutually exclusive publication/bootstrap
+API objects and CLI arguments. There is no content sniffing, auto-detection or
+fallback between them. The bootstrap route reauthenticates its externally
+pinned receipt, all 30 ordered manifest byte snapshots and the semantic JSONL
+on every provider creation. Manifest and shard path, digest and filesystem
+identity reuse across the 29+1 roles is rejected.
+
 The isolated backend remains import-compatible with CPython 3.9 through 3.12.
 Its runtime modules avoid PEP 604 unions and dataclass options introduced after
 3.9; CI compiles and imports every `atomic_v3` module at each supported minor.
@@ -70,6 +87,53 @@ must contain one king per color, at most 16 pieces per color and at most one
 piece per square; the WHITE and BLACK reconstructions must agree exactly.
 Outcomes are restricted to `0`, `0.5` or `1`, while scores must be integral
 signed-i32 values represented in the float32 training tensor.
+
+## Bootstrap sequential provider
+
+`atomic_v3.native_provider` is the deliberately conservative provider for the
+first 29-train/1-validation bootstrap selection. It uses the native C1 Atomic
+BIN V2 reader pinned through the `420c9f352` engine submodule. There is no
+random-access index, block shuffle, PRP, smart filter, loader auto-detection or
+background worker pool. One synchronous native worker walks manifests, shards
+and records in authenticated order and emits exact local V3 indices from
+`emit_full_refresh` for both king perspectives. The executor owns any effective
+batch accumulation; the provider's default transfer microbatch is 128.
+
+Training is one continuously living cyclic stream. Crossing the final training
+manifest increments its logical epoch and continues at the first manifest; a
+trainer epoch must never reconstruct or rewind it. Validation is non-cyclic,
+reports an explicit EOF (including a final partial batch), and may be recreated
+from its fixed initial cursor before each validation pass. For the bootstrap
+run, the executor takes the fixed one-million-accepted-position prefix from the
+dedicated validation manifest.
+
+The only sample selector is deterministic random FEN skipping with the
+historical default `random_fen_skipping=3` (one record retained in expectation
+out of four) for both roles. Validation requests one million *accepted*
+positions, so it normally reads about four million raw records; it does not
+shrink to 250,000 positions. Resetting its seed and raw cursor reproduces the
+same accepted million exactly. The old trainer's nominal filtered/smart-FEN
+path is intentionally not reproduced because its `do_filter()` implementation
+returned false for all records. Adding a new position filter here would
+silently change the historical sampling policy.
+
+The versioned C ABI owns explicit create, fetch, EOF, error, batch destruction,
+stream destruction, commit and committed-cursor operations. Fetch advances a
+working cursor; the persisted cursor advances only when the executor calls
+`commit()` after a successful optimizer step. The cursor binds the ordered
+manifest hashes/counts plus batch size, skip value, seed and cyclic role, so an
+exact resume cannot be applied to a different provider contract. Training
+reset is rejected; validation reset is explicit.
+
+At each manifest boundary the provider re-reads and hashes the exact immutable
+manifest bytes before C1 resolves any shard. C1 then copies, hashes and decodes
+only the current shard through its private auto-deleting snapshot. This snapshot
+is required security state, not an extra dataset cache: no persistent provider
+copy is created, completed/error/destroyed readers close it, and at most one
+snapshot is live. A production 12.5-million-record shard occupies
+`96 + 12,500,000 * 64 = 800,000,096` bytes (about 763 MiB), which is therefore
+the provider's peak temporary-disk requirement independent of whether the
+authenticated source lives on another volume.
 
 The controlled optimizer helper clips immediately before the forward and
 immediately after the update. Mixed i16/i8 tables, the inward float32-safe PSQT
@@ -90,6 +154,14 @@ opposite-sign edge pairs, then runs an Atomic V3 forward/backward and controlled
 optimizer step. Setting `ATOMIC_REQUIRE_CUDA_TESTS=1` makes a missing CUDA/CuPy
 runtime a session error rather than a skip.
 
+## Bootstrap execution contract
+
+H9.3l-k Slice2 adds the strict four-run Ranger/StepLR executor, exact
+microbatch accumulation and rolling atomic checkpoint/resume seam. See
+[`atomic-nnue-v3-bootstrap-executor.md`](atomic-nnue-v3-bootstrap-executor.md)
+for the frozen parameters and dry-run command. This does not weaken the
+bootstrap receipt's non-publication scope.
+
 ## Deliberate milestone limits
 
 H9.3l-j proves indexing, factorization, mixed feature forward, loss and a finite
@@ -101,7 +173,7 @@ just to run the CPU healthcheck. The caller's thread count and deterministic
 algorithm mode, including PyTorch's independent `warn_only` flag, are restored
 as well. It is not the production schedule.
 
-Checkpoint/network serialization, final dependency/environment binding,
-controlled execution evidence and the first real training run belong to
-H9.3l-k and later milestones. Nothing in this backend claims training
-publication readiness.
+The rolling training checkpoint is now implemented, but final network
+serialization, the audited native provider, controlled execution evidence and
+the first real training run remain later milestones. Nothing in this backend
+claims training publication readiness.

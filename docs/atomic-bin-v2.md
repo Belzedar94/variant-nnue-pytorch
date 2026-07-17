@@ -7,12 +7,17 @@ record decoding, Atomic legality and byte-exact canonical validation to the
 pinned Atomic-Stockfish reader.
 
 The engine submodule is fixed to
-`76764c3c01ce5965a793a65e4580dd5c95cd2916`. Configuration fails if the
+`420c9f35266fbdc2167dc5b9d8d20d90281c60c9`. Configuration fails if the
 gitlink, checkout, origin URL, schema hashes or `origin/main` ancestry differ,
 or if the submodule is dirty. In addition to the data and manifest schemas,
 the cross-repository handoff authenticates the public lossless decoder schema
 as SHA-256
 `5e3f8d7c6db6ee955b71747ee063859e15609adb557a3754228a606f3df2caad`.
+
+This descendant leaves the C1 Atomic BIN V2 schemas, parser and reader
+unchanged while adding the engine-side AtomicNNUEV3 oracles needed by the
+dedicated V3 provider. Dataset manifests retain their truthful producer commit;
+the consumer pin is not substituted into their provenance.
 
 The trainer continues to link the manifest reader directly and does not invoke
 the data-tools CLI. Its plural training-data capability handshake and reader

@@ -15,7 +15,11 @@ from .contract import (
     BLAST_RING_DIMENSIONS,
     CAPTURE_PAIR_DIMENSIONS,
     FEATURE_NAME,
+    FC0_OUTPUTS,
+    FC1_OUTPUTS,
+    FC2_OUTPUTS,
     HM_OUTPUT_DIMENSIONS,
+    HM_PHYSICAL_DIMENSIONS,
     HM_TRAINING_DIMENSIONS,
     HM_VIRTUAL_DIMENSIONS,
     KING_BLAST_EP_DIMENSIONS,
@@ -326,6 +330,39 @@ class AtomicNNUEV3(nn.Module):
         super().__init__()
         self.feature_transformer = AtomicV3FeatureTransformer(initialize=initialize)
         self.network = AtomicV3LayerStacks()
+        # A valid V3 wire can contain i32 values whose dequantized float32
+        # image is shared by more than one integer.  Keep the authenticated
+        # source integers as persistent, non-trainable buffers so an imported
+        # network remains exactly serializable after a normal state_dict
+        # checkpoint/resume.  These buffers are deliberately absent from the
+        # forward graph and add no optimizer state.
+        self.register_buffer(
+            "_atomic_v3_imported_i32_valid",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_atomic_v3_imported_hm_psqt_i32",
+            torch.zeros(
+                (HM_PHYSICAL_DIMENSIONS, PSQT_BUCKETS), dtype=torch.int32
+            ),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_atomic_v3_imported_fc0_bias_i32",
+            torch.zeros((LAYER_STACKS, FC0_OUTPUTS), dtype=torch.int32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_atomic_v3_imported_fc1_bias_i32",
+            torch.zeros((LAYER_STACKS, FC1_OUTPUTS), dtype=torch.int32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_atomic_v3_imported_fc2_bias_i32",
+            torch.zeros((LAYER_STACKS, FC2_OUTPUTS), dtype=torch.int32),
+            persistent=True,
+        )
 
     @torch.no_grad()
     def clip_weights(self) -> None:
