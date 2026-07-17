@@ -56,6 +56,21 @@ from atomic_v3.serialization import check_nnue, read_nnue, save_nnue
 CANARY_FORMAT = "atomic-v3-real-gpu-resume-canary-v2"
 
 
+def _write_canary_result(path: Path, result: dict[str, object]) -> None:
+    """Publish one ASCII JSON document with an exact LF terminator.
+
+    ``Path.write_text(..., newline=...)`` is unavailable on Python 3.9.  The
+    binary writer both preserves that supported runtime and avoids platform
+    newline translation, so the persisted receipt has identical bytes on
+    Windows and POSIX.
+    """
+
+    payload = (
+        json.dumps(result, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+    path.write_bytes(payload)
+
+
 def _set_frozen_threads() -> None:
     threads = production_config("lambda-0").threads
     torch.set_num_threads(threads)
@@ -313,11 +328,7 @@ def run_canary(arguments: argparse.Namespace) -> dict[str, object]:
             "final_cursor": final_cursor,
         }
         result_path = work_directory / "canary-result.json"
-        result_path.write_text(
-            json.dumps(result, indent=2, sort_keys=True) + "\n",
-            encoding="ascii",
-            newline="\n",
-        )
+        _write_canary_result(result_path, result)
         return result
     finally:
         del imported

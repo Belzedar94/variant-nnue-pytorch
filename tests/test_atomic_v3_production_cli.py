@@ -653,3 +653,139 @@ def test_canary_cli_reserves_stdout_for_one_json_document(monkeypatch, capfd):
     captured = capfd.readouterr()
     assert json.loads(captured.out) == expected
     assert captured.err == ""
+
+
+def test_canary_actual_result_path_is_python39_compatible_and_exact_lf(
+    tmp_path, monkeypatch
+):
+    import scripts.canary_atomic_v3_production as canary
+
+    provider_library = tmp_path / "provider.dll"
+    provider_library.write_bytes(b"provider")
+    work_directory = tmp_path / "canary"
+    snapshot = SimpleNamespace(receipt_sha256=SHA_A)
+    shared = SimpleNamespace(sha256=SHA_B)
+    shared_artifact = {"state_sha256": SHA_B}
+
+    class Provider:
+        def __init__(self):
+            self.cursor = {"accepted_samples": 0, "next_batch_sequence": 0}
+
+        def logical_cursor_state(self):
+            return dict(self.cursor)
+
+    class Prepared:
+        def __init__(self):
+            self.model = object()
+            self.optimizer = object()
+            self.scheduler = object()
+            self.training_provider = Provider()
+
+        def checkpoint_config_document(self):
+            return {"run": "lambda-0"}
+
+    prepared = [Prepared(), Prepared()]
+    monkeypatch.setattr(canary, "_validate_cuda_device", lambda _value: "cuda:0")
+    monkeypatch.setattr(canary, "inspect_bootstrap_roles", lambda *_args: snapshot)
+    monkeypatch.setattr(
+        canary,
+        "load_or_create_shared_initial_state",
+        lambda _path: (shared, shared_artifact),
+    )
+    monkeypatch.setattr(canary, "_prepare", lambda **_kwargs: prepared.pop(0))
+    monkeypatch.setattr(canary, "CheckpointBinding", lambda **_kwargs: object())
+    monkeypatch.setattr(canary, "CommitBinding", lambda _commit: object())
+    monkeypatch.setattr(
+        canary,
+        "DatasetBinding",
+        SimpleNamespace(from_bootstrap=lambda _snapshot: object()),
+    )
+    monkeypatch.setattr(canary, "cleanup_prepared", lambda _prepared: None)
+
+    def optimizer_step(item):
+        item.training_provider.cursor["accepted_samples"] += canary.EFFECTIVE_BATCH_SIZE
+        item.training_provider.cursor["next_batch_sequence"] += (
+            canary.EFFECTIVE_BATCH_SIZE // canary.MICROBATCH_SIZE
+        )
+        return SimpleNamespace(
+            samples=canary.EFFECTIVE_BATCH_SIZE,
+            steps=1,
+            mean_loss=0.125,
+        )
+
+    monkeypatch.setattr(canary, "_run_canary_optimizer_step", optimizer_step)
+    checkpoint_state = {}
+
+    def make_checkpoint(_model, _optimizer, _scheduler, cursor, counters, _binding):
+        checkpoint_state["cursor"] = dict(cursor)
+        checkpoint_state["counters"] = counters
+        return {"cursor": dict(cursor)}
+
+    def save_checkpoint(directory, _document):
+        path = Path(directory) / "last.ckpt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"checkpoint")
+        return path
+
+    monkeypatch.setattr(canary, "checkpoint_document", make_checkpoint)
+    monkeypatch.setattr(canary, "save_last_checkpoint", save_checkpoint)
+    monkeypatch.setattr(
+        canary,
+        "checkpoint_sha256",
+        lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(canary, "load_last_checkpoint", lambda *_args: object())
+
+    def restore_checkpoint(_document, _model, _optimizer, _scheduler, provider):
+        provider.cursor = dict(checkpoint_state["cursor"])
+        return checkpoint_state["counters"]
+
+    monkeypatch.setattr(canary, "restore_checkpoint", restore_checkpoint)
+    serialized = {}
+
+    def save_network(path, _model, description):
+        payload = b"strict-v3-canary"
+        Path(path).write_bytes(payload)
+        metadata = WireMetadata(
+            description=description,
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest().upper(),
+        )
+        serialized.update(description=description, metadata=metadata)
+        return metadata
+
+    monkeypatch.setattr(canary, "save_nnue", save_network)
+    monkeypatch.setattr(canary, "check_nnue", lambda _stream: serialized["metadata"])
+    monkeypatch.setattr(
+        canary,
+        "read_nnue",
+        lambda _stream: (object(), serialized["description"]),
+    )
+
+    # Python 3.9's Path.write_text has no ``newline`` keyword.  Replacing it
+    # with that historical signature makes the pre-fix production call fail,
+    # while the binary result writer remains supported on every target Python.
+    def python39_write_text(self, data, encoding=None, errors=None):
+        del self, data, encoding, errors
+        raise AssertionError("the canary result must not use Path.write_text")
+
+    monkeypatch.setattr(Path, "write_text", python39_write_text)
+    arguments = SimpleNamespace(
+        trainer_commit=TRAINER_COMMIT,
+        device="cuda:0",
+        provider_library=str(provider_library),
+        work_dir=str(work_directory),
+        bootstrap_source=("receipt.json", SHA_A),
+        shared_initial_state=str(tmp_path / "shared.pt"),
+    )
+    result = canary.run_canary(arguments)
+
+    payload = (work_directory / "canary-result.json").read_bytes()
+    expected = (
+        json.dumps(result, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+    assert payload == expected
+    assert b"\r\n" not in payload
+    decoded, end = json.JSONDecoder().raw_decode(payload.decode("ascii"))
+    assert decoded == result
+    assert payload.decode("ascii")[end:] == "\n"

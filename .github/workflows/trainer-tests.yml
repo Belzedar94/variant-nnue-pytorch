@@ -38,10 +38,11 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1+cpu
           python -m pip install numpy==1.26.4
 
-      - name: Compile and import every Atomic V3 module
+      - name: Compile, import and exercise every Atomic V3 production entry point
         run: |
-          python -m compileall -q atomic_v3
+          python -m compileall -q atomic_v3 train_atomic_v3.py scripts/canary_atomic_v3_production.py
           python -c "import importlib, pkgutil, atomic_v3; modules = [item.name for item in pkgutil.iter_modules(atomic_v3.__path__, atomic_v3.__name__ + '.')]; [importlib.import_module(name) for name in modules]; print(len(modules), 'Atomic V3 modules imported')"
+          python -c "import json, pathlib, tempfile; from scripts.canary_atomic_v3_production import _write_canary_result; root = pathlib.Path(tempfile.mkdtemp()); path = root / 'result.json'; result = {'status': 'passed'}; _write_canary_result(path, result); payload = path.read_bytes(); assert payload == (json.dumps(result, allow_nan=False, indent=2, sort_keys=True) + '\n').encode('ascii'); assert b'\r\n' not in payload"
 
   cpu:
     timeout-minutes: 15
