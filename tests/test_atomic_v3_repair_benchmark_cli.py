@@ -4,6 +4,7 @@ import json
 import pytest
 
 from atomic_v3.performance_benchmark import (
+    MEASUREMENT_MODE,
     BenchmarkBatch,
     BenchmarkOperations,
     VramSnapshot,
@@ -33,6 +34,7 @@ class FakeBackend:
         self.events = []
         self.cleanup_calls = 0
         self.load_calls = 0
+        self.synchronize_calls = 0
 
     def _stage(self, name):
         self.events.append(name)
@@ -57,13 +59,13 @@ class FakeBackend:
 
     def optimizer(self):
         self._stage("optimizer")
+        self.step += 1
 
     def synchronize(self):
-        pass
+        self.synchronize_calls += 1
 
     def vram(self):
         self.events.append("vram")
-        self.step += 1
         return VramSnapshot(
             allocated_bytes=1_000 + self.step,
             reserved_bytes=2_000 + self.step,
@@ -132,6 +134,17 @@ def test_real_command_adapter_runs_bounded_steps_and_always_cleans_up():
     assert document["checkpoints_written"] == 0
     assert document["ephemeral_optimizer_steps"] == 15
     assert document["identity"] == {"backend": "fake", "run_id": "lambda-0"}
+    assert document["benchmark"]["measurement_mode"] == MEASUREMENT_MODE
+    assert document["benchmark"]["measured_window"]["steps"] == 10
+    assert (
+        document["benchmark"]["measured_window"][
+            "boundary_device_synchronizations"
+        ]
+        == 2
+    )
+    assert document["benchmark"]["measured_window"]["wall_seconds"] == pytest.approx(
+        report.decision.metrics.elapsed_seconds
+    )
 
 
 def test_cli_prints_one_report_and_returns_zero_for_a_passing_gate():
@@ -203,6 +216,7 @@ def test_cli_reports_failure_and_cleans_up_without_any_checkpoint_path():
     assert document["epochs_started"] == 0
     assert document["checkpoints_written"] == 0
     assert fake.cleanup_calls == 1
+    assert fake.synchronize_calls == 2
 
 
 def test_import_and_parser_construction_do_not_load_a_backend():

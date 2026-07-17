@@ -6,9 +6,10 @@ CUDA.  A real GPU caller must explicitly provide synchronization and VRAM
 probes; unit tests can provide deterministic fakes.
 
 The harness runs configurable warm-up steps followed by 10--20 measured,
-production-shaped optimizer steps.  It reports full wall throughput and stage
-timings through :mod:`atomic_v3.performance_gate` and must not be used as a
-training loop.
+production-shaped optimizer steps. The measured steps form one contiguous
+window with only boundary synchronization, matching the asynchronous overlap
+of the real trainer. Per-stage host/launch timings are diagnostic only; the
+gate uses the exact synchronized window wall time.
 """
 
 from __future__ import annotations
@@ -32,14 +33,15 @@ from .performance_gate import (
 )
 
 
-BENCHMARK_FORMAT = "atomic-v3-non-production-performance-benchmark-v1"
+BENCHMARK_FORMAT = "atomic-v3-non-production-performance-benchmark-v2"
+MEASUREMENT_MODE = "contiguous-production-like-window-v1"
 MINIMUM_MEASURED_STEPS = 10
 MAXIMUM_MEASURED_STEPS = 20
 
-STAGE_PROVIDER_FETCH_H2D = "provider_fetch_h2d"
-STAGE_FORWARD_LOSS = "forward_loss"
-STAGE_BACKWARD = "backward"
-STAGE_OPTIMIZER_CLIPPING = "optimizer_clipping"
+STAGE_PROVIDER_FETCH_H2D = "host_launch_diagnostic_provider_fetch_h2d"
+STAGE_FORWARD_LOSS = "host_launch_diagnostic_forward_loss"
+STAGE_BACKWARD = "host_launch_diagnostic_backward"
+STAGE_OPTIMIZER_CLIPPING = "host_launch_diagnostic_optimizer_clipping"
 
 
 def _nonnegative_int(label: str, value: object) -> int:
@@ -233,6 +235,8 @@ class PerformanceBenchmarkReport:
     decision: GateDecision
     vram: VramSummary
     first_cold_measurement: Optional[StepMeasurement]
+    measured_window_wall_seconds: float
+    measured_window_samples: int
 
     @property
     def non_production(self) -> bool:
@@ -256,6 +260,17 @@ class PerformanceBenchmarkReport:
             "format": BENCHMARK_FORMAT,
             "non_production": True,
             "training_started": False,
+            "measurement_mode": MEASUREMENT_MODE,
+            "measured_window": {
+                "wall_seconds": self.measured_window_wall_seconds,
+                "steps": self.config.measured_steps,
+                "samples": self.measured_window_samples,
+                "boundary_device_synchronizations": 2,
+                "gate_elapsed_source": "measured_window.wall_seconds",
+                "stage_seconds_semantics": (
+                    "host_or_launch_diagnostics_only_not_gate_inputs"
+                ),
+            },
             "config": {
                 "epoch_samples": self.config.epoch_samples,
                 "warmup_steps": self.config.warmup_steps,
@@ -283,6 +298,9 @@ class PerformanceBenchmarkReport:
                 "first_step_elapsed_seconds": cold.elapsed_seconds,
                 "first_step_samples": cold.samples,
                 "first_step_stage_seconds": dict(cold.stage_seconds),
+                "first_step_stage_seconds_semantics": (
+                    "synchronized_warmup_diagnostics"
+                ),
                 "estimated_cold_authentication_seconds": (
                     self.decision.metrics.cold_authentication_seconds
                 ),
@@ -312,6 +330,20 @@ def _timed_call(
     elapsed = finished - started
     if not math.isfinite(elapsed) or elapsed < 0.0:
         raise RuntimeError("benchmark clock produced an invalid stage duration")
+    return result, elapsed
+
+
+def _host_timed_call(
+    callback: Callable[[], Any], *, clock: Callable[[], float]
+) -> tuple[Any, float]:
+    """Time host work / CUDA launch latency without synchronizing the device."""
+
+    started = clock()
+    result = callback()
+    finished = clock()
+    elapsed = finished - started
+    if not math.isfinite(elapsed) or elapsed < 0.0:
+        raise RuntimeError("benchmark clock produced an invalid host-stage duration")
     return result, elapsed
 
 
@@ -368,6 +400,86 @@ def _measure_step(
     )
 
 
+def _measure_contiguous_window(
+    operations: BenchmarkOperations,
+    *,
+    steps: int,
+    clock: Callable[[], float],
+) -> tuple[list[StepMeasurement], list[VramSnapshot], float, int]:
+    """Measure production-like steps with exactly two device synchronizations."""
+
+    operations.synchronize()
+    window_started = clock()
+    raw: list[tuple[int, dict[str, float]]] = []
+    try:
+        for _ in range(steps):
+            _, optimizer_prepare_seconds = _host_timed_call(
+                operations.prepare_optimizer_step, clock=clock
+            )
+            fetched, provider_seconds = _host_timed_call(
+                operations.fetch_and_h2d, clock=clock
+            )
+            if not isinstance(fetched, BenchmarkBatch):
+                raise TypeError("fetch_and_h2d must return BenchmarkBatch")
+            loss, forward_seconds = _host_timed_call(
+                lambda: operations.forward_loss(fetched.payload), clock=clock
+            )
+            _, backward_seconds = _host_timed_call(
+                lambda: operations.backward(loss), clock=clock
+            )
+            _, optimizer_finish_seconds = _host_timed_call(
+                operations.optimizer_and_clipping, clock=clock
+            )
+            raw.append(
+                (
+                    fetched.samples,
+                    {
+                        STAGE_PROVIDER_FETCH_H2D: provider_seconds,
+                        STAGE_FORWARD_LOSS: forward_seconds,
+                        STAGE_BACKWARD: backward_seconds,
+                        STAGE_OPTIMIZER_CLIPPING: (
+                            optimizer_prepare_seconds + optimizer_finish_seconds
+                        ),
+                    },
+                )
+            )
+        operations.synchronize()
+    except BaseException:
+        # A callback may fail after enqueuing asynchronous CUDA work. Drain it
+        # before the adapter tears down its state, but never replace the
+        # original diagnostic with a secondary synchronization failure.
+        try:
+            operations.synchronize()
+        except BaseException:
+            pass
+        raise
+    window_finished = clock()
+    wall_seconds = window_finished - window_started
+    if not math.isfinite(wall_seconds) or wall_seconds <= 0.0:
+        raise RuntimeError("benchmark clock produced an invalid window wall duration")
+    # CUDA peak counters retain the whole window's maximum. Probe once only
+    # after the drained-window timestamp so host-side diagnostics cannot alter
+    # the production-throughput gate.
+    snapshot = operations.vram_probe()
+    if not isinstance(snapshot, VramSnapshot):
+        raise TypeError("vram_probe must return VramSnapshot")
+    total_samples = sum(samples for samples, _ in raw)
+    if total_samples <= 0:
+        raise RuntimeError("benchmark window produced no samples")
+    # StepMeasurement remains the common aggregation wire. Distribute only the
+    # exact window wall by sample count; individual stage values retain their
+    # independently observed host/launch diagnostic meaning.
+    measurements = [
+        StepMeasurement(
+            samples=samples,
+            elapsed_seconds=wall_seconds * samples / total_samples,
+            stage_seconds=stage_seconds,
+        )
+        for samples, stage_seconds in raw
+    ]
+    return measurements, [snapshot], wall_seconds, total_samples
+
+
 def _summarize_vram(snapshots: list[VramSnapshot]) -> VramSummary:
     if not snapshots:
         raise ValueError("at least one VRAM snapshot is required")
@@ -399,35 +511,53 @@ def run_performance_benchmark(
     _callable("clock", clock)
 
     snapshots: list[VramSnapshot] = []
-    measurements: list[StepMeasurement] = []
+    warmup_measurements: list[StepMeasurement] = []
     total_steps = config.warmup_steps + config.measured_steps
-    for _ in range(total_steps):
+    for _ in range(config.warmup_steps):
         measurement = _measure_step(operations, clock=clock)
-        measurements.append(measurement)
+        warmup_measurements.append(measurement)
         snapshot = operations.vram_probe()
         if not isinstance(snapshot, VramSnapshot):
             raise TypeError("vram_probe must return VramSnapshot")
         snapshots.append(snapshot)
-
-    measured = measurements[config.warmup_steps :]
+    (
+        measured,
+        measured_snapshots,
+        measured_window_wall_seconds,
+        measured_window_samples,
+    ) = _measure_contiguous_window(
+        operations,
+        steps=config.measured_steps,
+        clock=clock,
+    )
+    snapshots.extend(measured_snapshots)
     if len(measured) != config.measured_steps:
         raise RuntimeError("benchmark ended without the exact measured-step window")
     # Warm-up number one pays the provider's full snapshot/hash authentication.
     # It must not contaminate steady optimizer throughput, but it also must not
     # disappear from the epoch budget.  Estimate only its excess over one
-    # steady step and amortize that cost by the expected shard events/epoch.
-    steady = aggregate_measurements(measured, epoch_samples=config.epoch_samples)
-    first_cold = measurements[0] if config.warmup_steps else None
+    # steady provider fetch from the remaining identically synchronized
+    # warmups, then amortize that cost by expected shard events/epoch.
+    first_cold = warmup_measurements[0] if warmup_measurements else None
     cold_authentication_seconds = 0.0
     if first_cold is not None:
-        measured_provider_seconds = steady.stage_seconds.get(
-            STAGE_PROVIDER_FETCH_H2D, 0.0
-        )
-        expected_steady_seconds = (
-            measured_provider_seconds
-            * first_cold.samples
-            / steady.samples
-        )
+        cold_references = warmup_measurements[1:]
+        if cold_references:
+            reference_samples = sum(item.samples for item in cold_references)
+            reference_provider_seconds = sum(
+                item.stage_seconds.get(STAGE_PROVIDER_FETCH_H2D, 0.0)
+                for item in cold_references
+            )
+            expected_steady_seconds = (
+                reference_provider_seconds
+                * first_cold.samples
+                / reference_samples
+            )
+        else:
+            # Production fixes five warmups. This fallback keeps the generic
+            # diagnostic API defined without mixing synchronized and
+            # asynchronous stage semantics.
+            expected_steady_seconds = 0.0
         cold_authentication_seconds = max(
             0.0,
             first_cold.stage_seconds.get(STAGE_PROVIDER_FETCH_H2D, 0.0)
@@ -465,12 +595,15 @@ def run_performance_benchmark(
         decision=decision,
         vram=_summarize_vram(snapshots),
         first_cold_measurement=first_cold,
+        measured_window_wall_seconds=measured_window_wall_seconds,
+        measured_window_samples=measured_window_samples,
     )
 
 
 __all__ = [
     "BENCHMARK_FORMAT",
     "MAXIMUM_MEASURED_STEPS",
+    "MEASUREMENT_MODE",
     "MINIMUM_MEASURED_STEPS",
     "STAGE_BACKWARD",
     "STAGE_FORWARD_LOSS",

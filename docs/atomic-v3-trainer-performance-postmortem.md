@@ -30,6 +30,11 @@ the repaired trainer.
   seconds per epoch per run.  The normal uncontended observation is three to
   four minutes.
 - Four serial 37-epoch Atomic V3 runs would have taken roughly twenty days.
+- The first repaired preflight then reported roughly 672 seconds and rejected
+  the campaign. That number was also invalid: the benchmark synchronized CUDA
+  before and after every stage, destroying the asynchronous CPU-provider/GPU
+  overlap used by production. It was a measurement defect, not evidence that
+  the repaired trainer itself needed 672 seconds per epoch.
 
 ## Technical causes
 
@@ -65,6 +70,9 @@ the repaired trainer.
 - The production status already exposed an impossible ETA, but no circuit
   breaker converted it into a failure.  The user, not automation, detected the
   incident.
+- The first performance gate serialized the pipeline it was intended to
+  measure. Review checked the threshold logic but did not initially verify the
+  synchronization topology against the production loop.
 
 ## Repair boundary
 
@@ -92,9 +100,12 @@ Before another multi-epoch campaign:
    lambda runs.
 3. Verify CPU reference versus CUDA fused forward and gradients, including HM
    base/virtual rows and mixed i16/i8 quantization boundaries.
-4. Warm up and measure at least ten production-shaped optimizer steps.  Report
-   loader, transfer, forward, backward, optimizer and clipping time, accepted
-   positions per second, VRAM and projected epoch duration.
+4. Warm up exactly five steps, then measure ten production-shaped optimizer
+   steps as one contiguous CUDA fill/drain window with only a synchronization
+   at each boundary. Gate only on exact window wall time. Report per-stage
+   host/launch diagnostics as non-gating values, accepted positions per second,
+   a post-window VRAM/peak snapshot and projected epoch duration. Measure cold
+   authentication from warm-up one versus synchronized warm-ups two to five.
 5. Target at most five minutes per epoch.  Automatically reject a projected
    epoch strictly above ten minutes.
 6. Complete one real epoch, checkpoint, resume, serialize, strict-check and

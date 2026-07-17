@@ -38,7 +38,7 @@ from atomic_v3.performance_benchmark import (
 )
 
 
-REAL_BENCHMARK_FORMAT = "atomic-v3-repair-real-performance-benchmark-v1"
+REAL_BENCHMARK_FORMAT = "atomic-v3-repair-real-performance-benchmark-v2"
 RUN_IDS = (
     "lambda-0",
     "lambda-025",

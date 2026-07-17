@@ -91,10 +91,24 @@ manifest/evidence closure and loads the provider DLL by an explicit path. It
 then performs a mandatory same-process preflight with exactly five warm-up and
 ten measured ephemeral optimizer steps. The first cold provider authentication
 is retained and amortized across the expected shard authentications per epoch.
+The ten measured steps are one production-like fill/drain window: synchronize,
+start the wall clock, execute ten complete fetch/forward/backward/optimizer/
+clip/provider-commit steps, synchronize, then stop the clock. There are no
+per-stage or per-step device synchronizations in that window. Stage values are
+host/CUDA-launch diagnostics only and never feed the gate; its throughput uses
+the exact window wall. One CUDA allocator/peak probe is taken after the stop
+timestamp. The first cold authentication is measured separately with
+synchronized warm-up diagnostics and compared only with warm-ups two through
+five, which have the same timing semantics.
 The gate reports training-only time separately and reserves 60 seconds for
 validation/checkpoint work: 300 seconds is the conservative total target and a
 total above 600 seconds is a hard rejection. `--preflight-only` emits the full
 machine-readable gate report while starting zero epochs and checkpoints.
+
+The bounded ten-step preflight does not include the campaign's 32-step finite
+sentinel/heartbeat boundary. The cumulative in-campaign breaker measures those
+real 32-step windows, including that synchronization, so the mandatory gate
+does not hide the periodic production cost.
 
 Only an accepted gate may create campaign directories. Its mutated model and
 provider are discarded before a fresh `prepare_production_run` enters the
