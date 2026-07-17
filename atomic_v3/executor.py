@@ -10,10 +10,11 @@ the training provider at an epoch boundary.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 import random
+import time
 from typing import Callable, Mapping, Optional, Protocol, runtime_checkable
 
 import numpy as np
@@ -30,8 +31,20 @@ from .checkpoint import (
     restore_checkpoint,
     save_last_checkpoint,
 )
-from .dataset import AtomicV3Batch, validate_batch
+from .dataset import (
+    AtomicV3Batch,
+    PerspectiveBatch,
+    SparseSliceBatch,
+    validate_batch,
+    validate_batch_layout,
+)
 from .model import AtomicNNUEV3
+from .performance_gate import (
+    CumulativePerformanceGate,
+    PerformanceGateRejected,
+    PerformanceGatePolicy,
+    StepMeasurement,
+)
 from .training import batch_loss
 
 
@@ -40,7 +53,7 @@ EPOCHS = 37
 EPOCH_SIZE = 20_000_000
 VALIDATION_SIZE = 1_000_000
 EFFECTIVE_BATCH_SIZE = 16_384
-MICROBATCH_SIZE = 128
+MICROBATCH_SIZE = EFFECTIVE_BATCH_SIZE
 ACCUMULATION_STEPS = EFFECTIVE_BATCH_SIZE // MICROBATCH_SIZE
 TRAINING_STEPS_PER_EPOCH = math.ceil(EPOCH_SIZE / EFFECTIVE_BATCH_SIZE)
 TRAINING_SAMPLES_PER_EPOCH = TRAINING_STEPS_PER_EPOCH * EFFECTIVE_BATCH_SIZE
@@ -61,10 +74,27 @@ RANGER_K = 6
 RANGER_N_SMA_THRESHOLD = 5
 SCHEDULER_GAMMA = 0.987
 PROGRESS_INTERVAL_STEPS = 32
+CANARY_SEMANTIC_SAMPLES = 64
+HARD_MAX_TOTAL_EPOCH_SECONDS = 600.0
 
 
 class ExecutorError(ValueError):
     """A production execution invariant was violated."""
+
+
+class EpochWallTimeRejected(RuntimeError):
+    """A completed, checkpointed epoch exceeded the hard wall-time limit."""
+
+    def __init__(self, diagnostic: Mapping[str, object]) -> None:
+        self.diagnostic = dict(diagnostic)
+        super().__init__(
+            "Atomic V3 full epoch wall-time gate rejected "
+            f"{self.diagnostic['elapsed_seconds']:.3f} seconds"
+        )
+
+
+class PersistenceFiniteStateError(FloatingPointError):
+    """Model or optimizer state is unsafe to persist."""
 
 
 def _positive_int(label: str, value: object) -> int:
@@ -156,7 +186,7 @@ class ProductionRunConfig:
     effective_batch_size: int = EFFECTIVE_BATCH_SIZE
     seed: int = SEED
     random_skip: int = RANDOM_SKIP
-    validation_random_skip: int = RANDOM_SKIP
+    validation_random_skip: int = 0
     precision: str = PRECISION
     gpus: int = GPUS
     threads: int = THREADS
@@ -170,7 +200,7 @@ class ProductionRunConfig:
             "effective_batch_size": EFFECTIVE_BATCH_SIZE,
             "seed": SEED,
             "random_skip": RANDOM_SKIP,
-            "validation_random_skip": RANDOM_SKIP,
+            "validation_random_skip": 0,
             "precision": PRECISION,
             "gpus": GPUS,
             "threads": THREADS,
@@ -405,14 +435,61 @@ def validate_provider_canary(
     batch = provider.next_batch(MICROBATCH_SIZE)
     if not isinstance(batch, ProviderBatch):
         raise TypeError("provider.next_batch must return ProviderBatch")
-    batch.validate(MICROBATCH_SIZE, exact=True)
     if not isinstance(batch.payload, AtomicV3Batch):
         raise TypeError("production provider payload must be AtomicV3Batch")
-    validate_batch(batch.payload)
+    validate_batch_layout(batch.payload)
+    batch.validate(MICROBATCH_SIZE, exact=True)
+    # The provider is configured for the production-sized physical batch, but
+    # replaying the Python board reconstruction for all 16,384 rows would turn
+    # a startup smoke test into minutes of GPU scalar transfers and Python
+    # loops.  The complete dataset was already authenticated and semantically
+    # audited when its receipt was published.  Here we validate the ABI/shape
+    # for the full batch and reconstruct a bounded sample which is sufficient
+    # to catch a mismatched native/Python layout.
+    validate_batch(_semantic_canary_sample(batch.payload))
     provider.restore_logical_cursor(copy.deepcopy(initial))
     if canonical_cursor_bytes(_provider_cursor(provider)) != initial_bytes:
         raise ExecutorError(f"{role} provider failed exact canary cursor restore")
     return copy.deepcopy(initial)
+
+
+def _semantic_canary_sample(batch: AtomicV3Batch) -> AtomicV3Batch:
+    samples = min(batch.batch_size, CANARY_SEMANTIC_SAMPLES)
+    if samples == 1:
+        rows = (0,)
+    else:
+        rows = tuple(
+            index * (batch.batch_size - 1) // (samples - 1)
+            for index in range(samples)
+        )
+    selection = torch.tensor(
+        rows, dtype=torch.long, device=batch.side_to_move_white.device
+    )
+
+    def owned(value: torch.Tensor) -> torch.Tensor:
+        return value.index_select(0, selection).detach().to(device="cpu").clone()
+
+    def sparse(value: SparseSliceBatch) -> SparseSliceBatch:
+        return SparseSliceBatch(owned(value.indices), owned(value.values))
+
+    def perspective(value: PerspectiveBatch) -> PerspectiveBatch:
+        return PerspectiveBatch(
+            own_king_squares=owned(value.own_king_squares),
+            hm=sparse(value.hm),
+            capture_pair=sparse(value.capture_pair),
+            king_blast_ep=sparse(value.king_blast_ep),
+            blast_ring=sparse(value.blast_ring),
+        )
+
+    return AtomicV3Batch(
+        side_to_move_white=owned(batch.side_to_move_white),
+        piece_counts=owned(batch.piece_counts),
+        white=perspective(batch.white),
+        black=perspective(batch.black),
+        outcome=owned(batch.outcome),
+        score=owned(batch.score),
+        bucket_indices=owned(batch.bucket_indices),
+    )
 
 
 @dataclass(frozen=True)
@@ -727,13 +804,124 @@ def _default_loss(model: torch.nn.Module, payload: object, lambda_value: float) 
         raise TypeError("default production loss requires AtomicV3Batch")
     # The provider canary already ran the full semantic/board reconstruction.
     # Repeating it here would perform Python loops and CUDA scalar transfers for
-    # every 128-position microbatch.
-    return batch_loss(model, payload, lambda_=lambda_value, validate=False)
+    # every physical CUDA batch.
+    return batch_loss(
+        model,
+        payload,
+        lambda_=lambda_value,
+        validate=False,
+        check_finite=False,
+    )
 
 
-def _clip_function(model: torch.nn.Module) -> ClipFunction:
+def _training_clip_function(model: torch.nn.Module) -> ClipFunction:
+    """Return the inexpensive per-step clamp used by the proven trainer path.
+
+    AtomicNNUEV3 keeps its exact float64/i32 export checks in ``clip_weights``.
+    Those checks are intentionally an epoch/checkpoint boundary, not part of
+    every optimizer step.  Small test models and older callers keep working by
+    falling back to their only clip method.
+    """
+
+    clip = getattr(model, "clip_training_weights", None)
+    if callable(clip):
+        return clip
+    exact = getattr(model, "clip_weights", None)
+    return exact if callable(exact) else (lambda: None)
+
+
+def _exact_clip_function(model: torch.nn.Module) -> ClipFunction:
     clip = getattr(model, "clip_weights", None)
     return clip if callable(clip) else (lambda: None)
+
+
+def _nested_floating_tensors(
+    value: object, *, seen_containers: set[int]
+):
+    if isinstance(value, torch.Tensor):
+        if value.is_floating_point():
+            yield value
+        return
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen_containers:
+            return
+        seen_containers.add(identity)
+        for nested in value.values():
+            yield from _nested_floating_tensors(
+                nested, seen_containers=seen_containers
+            )
+        return
+    if isinstance(value, (tuple, list)):
+        identity = id(value)
+        if identity in seen_containers:
+            return
+        seen_containers.add(identity)
+        for nested in value:
+            yield from _nested_floating_tensors(
+                nested, seen_containers=seen_containers
+            )
+
+
+def audit_persistence_finite_state(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer
+) -> dict[str, int]:
+    """Once-per-epoch finite audit at the checkpoint replacement boundary.
+
+    All floating parameters/buffers and every floating tensor nested in Ranger
+    state are reduced on-device.  The production contract is one CUDA device,
+    so the normal path performs one scalar host synchronization; the generic
+    implementation performs at most one per distinct tensor device.
+    """
+
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("persistence audit model must be torch.nn.Module")
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        raise TypeError("persistence audit optimizer must be torch optimizer")
+    sentinels: dict[torch.device, torch.Tensor] = {}
+    seen_tensors: set[int] = set()
+    model_tensors = 0
+    optimizer_tensors = 0
+
+    def observe(tensor: torch.Tensor, *, optimizer_state: bool) -> None:
+        nonlocal model_tensors, optimizer_tensors
+        identity = id(tensor)
+        if identity in seen_tensors or not tensor.is_floating_point():
+            return
+        seen_tensors.add(identity)
+        if optimizer_state:
+            optimizer_tensors += 1
+        else:
+            model_tensors += 1
+        finite = torch.isfinite(tensor.detach()).all()
+        existing = sentinels.get(finite.device)
+        sentinels[finite.device] = (
+            finite if existing is None else torch.logical_and(existing, finite)
+        )
+
+    for parameter in model.parameters():
+        observe(parameter, optimizer_state=False)
+    for buffer in model.buffers():
+        observe(buffer, optimizer_state=False)
+    seen_containers: set[int] = set()
+    for state in optimizer.state.values():
+        for tensor in _nested_floating_tensors(
+            state, seen_containers=seen_containers
+        ):
+            observe(tensor, optimizer_state=True)
+
+    # One bounded scalar transfer/synchronization per device. Atomic V3
+    # production is single-CUDA-device, therefore this is exactly one there.
+    if any(not bool(finite.item()) for finite in sentinels.values()):
+        raise PersistenceFiniteStateError(
+            "Atomic V3 checkpoint rejected non-finite model/optimizer state "
+            f"({model_tensors} model tensors, {optimizer_tensors} optimizer tensors)"
+        )
+    return {
+        "model_floating_tensors": model_tensors,
+        "optimizer_floating_tensors": optimizer_tensors,
+        "device_synchronizations": len(sentinels),
+    }
 
 
 def _metric_add(
@@ -748,7 +936,8 @@ def _metric_add(
 def _metric_mean(total: Optional[torch.Tensor], samples: int, label: str) -> float:
     if total is None or samples <= 0:
         raise ExecutorError(f"{label} metric has no samples")
-    # This is the sole loss-to-host synchronization for the whole epoch.
+    # This is the only full loss-value transfer.  Heartbeats transfer only one
+    # reduced finite/not-finite boolean every 32 committed optimizer steps.
     value = float((total / samples).detach().cpu())
     if not math.isfinite(value):
         raise FloatingPointError(f"Atomic V3 {label} loss is not finite")
@@ -760,6 +949,31 @@ def _commit_training_step(provider: ResumableBatchProvider) -> None:
     if not callable(commit):
         raise TypeError("training provider must implement commit")
     commit()
+
+
+def _heartbeat_finite_sentinel(
+    model: torch.nn.Module, weighted_loss: Optional[torch.Tensor]
+) -> None:
+    """Reduce loss and all live gradients to one bounded host synchronization."""
+
+    if weighted_loss is None:
+        raise FloatingPointError("Atomic V3 heartbeat has no accumulated loss")
+    device = weighted_loss.device
+    finite = torch.isfinite(weighted_loss)
+    for parameter in model.parameters():
+        gradient = parameter.grad
+        if gradient is not None:
+            gradient_finite = torch.isfinite(gradient).all()
+            if gradient_finite.device != device:
+                gradient_finite = gradient_finite.to(device=device)
+            finite = torch.logical_and(finite, gradient_finite)
+    # This is the only loss/gradient device-to-host synchronization at the
+    # 32-step heartbeat.  It also drains prior same-stream optimizer work so
+    # the wall clock below covers the real provider + GPU training path.
+    if not bool(finite.item()):
+        raise FloatingPointError(
+            "Atomic V3 heartbeat detected non-finite loss or gradient"
+        )
 
 
 def train_epoch(
@@ -775,8 +989,10 @@ def train_epoch(
     require_full_microbatches: bool = False,
     progress_callback: Optional[StepProgressCallback] = None,
     progress_interval_steps: int = PROGRESS_INTERVAL_STEPS,
+    performance_gate: Optional[CumulativePerformanceGate] = None,
+    heartbeat_clock: Callable[[], float] = time.perf_counter,
 ) -> EpochMetrics:
-    """Train one exact sample budget with sample-weighted microbatches."""
+    """Train one exact sample budget with a physical CUDA batch by default."""
 
     lambda_value = _finite_unit("lambda", lambda_value)
     sample_budget = _positive_int("training sample budget", sample_budget)
@@ -790,18 +1006,25 @@ def train_epoch(
         raise TypeError("loss_function must be callable")
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable or None")
+    if performance_gate is not None and not isinstance(
+        performance_gate, CumulativePerformanceGate
+    ):
+        raise TypeError("performance_gate must be CumulativePerformanceGate or None")
+    if not callable(heartbeat_clock):
+        raise TypeError("heartbeat_clock must be callable")
     progress_interval_steps = _positive_int(
         "progress interval steps", progress_interval_steps
     )
-    clip = _clip_function(model)
+    clip = _training_clip_function(model)
     model.train()
     consumed = 0
     steps = 0
     weighted_loss: Optional[torch.Tensor] = None
+    heartbeat_started = heartbeat_clock()
+    heartbeat_samples = 0
     while consumed < sample_budget:
         step_samples = min(effective_batch_size, sample_budget - consumed)
         optimizer.zero_grad(set_to_none=True)
-        clip()
         accumulated = 0
         while accumulated < step_samples:
             request = min(microbatch_size, step_samples - accumulated)
@@ -815,24 +1038,41 @@ def train_epoch(
             # Each loss is a microbatch mean.  Scale by its exact contribution
             # to this optimizer step, including the final partial microbatch.
             (loss * (batch.samples / step_samples)).backward()
-            coalesce_sparse_gradients(model)
             weighted_loss = _metric_add(weighted_loss, loss, batch.samples)
             accumulated += batch.samples
-        _check_finite_gradients(model)
         densify_sparse_gradients(model)
-        _check_finite_gradients(model)
         optimizer.step()
         clip()
         _commit_training_step(provider)
         consumed += step_samples
         steps += 1
-        if progress_callback is not None and (
-            steps % progress_interval_steps == 0 or consumed == sample_budget
-        ):
-            # This callback deliberately observes only the committed native
-            # cursor and integer counters. It performs no loss transfer or CUDA
-            # synchronization in the microbatch hot path.
-            progress_callback(steps, consumed, copy.deepcopy(_provider_cursor(provider)))
+        if steps % progress_interval_steps == 0 or consumed == sample_budget:
+            _heartbeat_finite_sentinel(model, weighted_loss)
+            heartbeat_finished = heartbeat_clock()
+            elapsed = heartbeat_finished - heartbeat_started
+            if not math.isfinite(elapsed) or elapsed <= 0.0:
+                raise ExecutorError("heartbeat clock produced an invalid duration")
+            gate_decision = None
+            if performance_gate is not None:
+                gate_decision = performance_gate.observe(
+                    StepMeasurement(
+                        samples=consumed - heartbeat_samples,
+                        elapsed_seconds=elapsed,
+                    )
+                )
+            if progress_callback is not None:
+                # Emit the heartbeat after observing the gate so a rejected
+                # decision, reason, samples and projection reach status.json
+                # before the latched exception stops the campaign.
+                progress_callback(
+                    steps, consumed, copy.deepcopy(_provider_cursor(provider))
+                )
+            if gate_decision is not None and gate_decision.rejected:
+                raise PerformanceGateRejected(gate_decision)
+            # Status/ETA IO belongs outside training throughput.  Start the
+            # next chunk only after the callback has returned.
+            heartbeat_started = heartbeat_clock()
+            heartbeat_samples = consumed
     return EpochMetrics(consumed, steps, _metric_mean(weighted_loss, consumed, "training"))
 
 
@@ -973,6 +1213,38 @@ def _emit_progress(
         callback(dict(document))
 
 
+def _campaign_performance_gate_for_cursor(
+    policy: PerformanceGatePolicy,
+    *,
+    minimum_measured_samples: int,
+    cursor: Mapping[str, object],
+) -> tuple[CumulativePerformanceGate, bool]:
+    """Bind the one-off cold exclusion to the cursor's actual staging state."""
+
+    record_index = cursor.get("record_index")
+    eof = cursor.get("eof")
+    if isinstance(record_index, bool) or not isinstance(record_index, int):
+        raise ExecutorError("performance cursor record_index is not an integer")
+    if eof not in (False, True, 0, 1):
+        raise ExecutorError("performance cursor eof flag is invalid")
+    # Native restore eagerly stages the containing shard whenever record_index
+    # is nonzero.  That IO happened before train_epoch starts its heartbeat
+    # clock, so subtracting the preflight cold cost would underproject runtime.
+    # At record_index zero (fresh or exact manifest boundary), staging remains
+    # lazy and the first timed fetch really does include it.
+    first_timed_fetch_includes_staging = not bool(eof) and record_index == 0
+    effective_policy = policy
+    if not first_timed_fetch_includes_staging and policy.elapsed_exclusion_seconds:
+        effective_policy = replace(policy, elapsed_exclusion_seconds=0.0)
+    return (
+        CumulativePerformanceGate(
+            effective_policy,
+            minimum_measured_samples=minimum_measured_samples,
+        ),
+        first_timed_fetch_includes_staging,
+    )
+
+
 def _learning_rates(optimizer: torch.optim.Optimizer) -> list[float]:
     return [float(group["lr"]) for group in optimizer.param_groups]
 
@@ -984,6 +1256,9 @@ def run_production(
     *,
     resume: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
+    performance_policy: Optional[PerformanceGatePolicy] = None,
+    performance_minimum_samples: Optional[int] = None,
+    epoch_wall_clock: Callable[[], float] = time.perf_counter,
 ) -> TrainingCounters:
     """Execute all remaining epochs, writing only rolling ``last.ckpt``.
 
@@ -996,6 +1271,22 @@ def run_production(
         raise TypeError("production execution requires PreparedProductionRun")
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable or None")
+    if not callable(epoch_wall_clock):
+        raise TypeError("epoch_wall_clock must be callable")
+    if performance_policy is not None and not isinstance(
+        performance_policy, PerformanceGatePolicy
+    ):
+        raise TypeError("performance_policy must be PerformanceGatePolicy or None")
+    if performance_policy is None:
+        if performance_minimum_samples is not None:
+            raise ExecutorError(
+                "performance_minimum_samples requires a performance policy"
+            )
+        performance_minimum = None
+    else:
+        performance_minimum = _positive_int(
+            "performance minimum samples", performance_minimum_samples
+        )
     config = prepared.config.validate()
     model = prepared.model
     optimizer = prepared.optimizer
@@ -1032,6 +1323,18 @@ def run_production(
         )
     cursor = _provider_cursor(training_provider)
     validate_production_counters(config, counters, cursor)
+    performance_gate = None
+    first_timed_fetch_includes_staging = None
+    if performance_policy is not None:
+        assert performance_minimum is not None
+        (
+            performance_gate,
+            first_timed_fetch_includes_staging,
+        ) = _campaign_performance_gate_for_cursor(
+            performance_policy,
+            minimum_measured_samples=performance_minimum,
+            cursor=cursor,
+        )
     _emit_progress(
         progress_callback,
         {
@@ -1047,16 +1350,29 @@ def run_production(
             "learning_rates": _learning_rates(optimizer),
             "cursor": dict(cursor),
             "resumed_from_checkpoint": bool(resume),
+            "first_timed_fetch_includes_shard_staging": (
+                first_timed_fetch_includes_staging
+            ),
         },
     )
     for epoch_index in range(counters.completed_epochs, config.epochs):
         lambda_value = config.lambda_schedule.value(epoch_index)
+        # Starts after all preparation/checkpoint restore work and immediately
+        # before entering train_epoch.  The matching end timestamp is taken
+        # only after exact clip, validation, scheduler, checkpoint and its
+        # persisted status event have all completed.
+        epoch_wall_started = epoch_wall_clock()
 
         def step_progress(
             epoch_steps: int,
             epoch_samples: int,
             step_cursor: Mapping[str, object],
         ) -> None:
+            gate_document = (
+                None
+                if performance_gate is None or performance_gate.decision is None
+                else performance_gate.decision.to_document()
+            )
             _emit_progress(
                 progress_callback,
                 {
@@ -1075,21 +1391,34 @@ def run_production(
                     "lambda": lambda_value,
                     "learning_rates": _learning_rates(optimizer),
                     "cursor": dict(step_cursor),
+                    "finite_loss_gradient_sentinel": "passed",
+                    "cumulative_performance_gate": gate_document,
                 },
             )
 
+        training_keywords: dict[str, object] = {
+            "lambda_value": lambda_value,
+            "sample_budget": TRAINING_SAMPLES_PER_EPOCH,
+            "effective_batch_size": config.effective_batch_size,
+            "microbatch_size": MICROBATCH_SIZE,
+            "require_full_microbatches": True,
+            "progress_callback": step_progress,
+            "progress_interval_steps": PROGRESS_INTERVAL_STEPS,
+        }
+        if performance_gate is not None:
+            training_keywords["performance_gate"] = performance_gate
         training = train_epoch(
             model,
             optimizer,
             training_provider,
-            lambda_value=lambda_value,
-            sample_budget=TRAINING_SAMPLES_PER_EPOCH,
-            effective_batch_size=config.effective_batch_size,
-            microbatch_size=MICROBATCH_SIZE,
-            require_full_microbatches=True,
-            progress_callback=step_progress,
-            progress_interval_steps=PROGRESS_INTERVAL_STEPS,
+            **training_keywords,
         )
+
+        # Exact signed-wire range/clamp checks are expensive by design. Run
+        # them once per epoch, never in the 1,221-step hot path. The complete
+        # model-plus-optimizer finite audit is a separate persistence boundary
+        # below, after validation and immediately before checkpoint creation.
+        _exact_clip_function(model)()
 
         _emit_progress(
             progress_callback,
@@ -1148,6 +1477,10 @@ def run_production(
             model, optimizer, scheduler, completed_epochs=counters.completed_epochs
         )
         validate_production_counters(config, counters, cursor)
+        # Last trust boundary before replacing last.ckpt. Exact clamp/export
+        # checks do not make NaN finite, and Ranger moments are not model
+        # parameters, so audit both complete persistence graphs explicitly.
+        finite_audit = audit_persistence_finite_state(model, optimizer)
         document = checkpoint_document(
             model, optimizer, scheduler, cursor, counters, checkpoint_binding
         )
@@ -1179,6 +1512,46 @@ def run_production(
                 },
             },
         )
+        epoch_wall_finished = epoch_wall_clock()
+        epoch_wall_seconds = epoch_wall_finished - epoch_wall_started
+        if not math.isfinite(epoch_wall_seconds) or epoch_wall_seconds < 0.0:
+            raise ExecutorError("epoch wall clock produced an invalid duration")
+        epoch_wall_rejected = epoch_wall_seconds > HARD_MAX_TOTAL_EPOCH_SECONDS
+        epoch_wall_diagnostic: dict[str, object] = {
+            "status": "rejected" if epoch_wall_rejected else "accepted",
+            "elapsed_seconds": epoch_wall_seconds,
+            "hard_max_total_epoch_seconds": HARD_MAX_TOTAL_EPOCH_SECONDS,
+            "checkpoint_preserved_for_resume": True,
+            "completed_epoch": counters.completed_epochs,
+        }
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "epoch-wall-gate",
+                "phase": "checkpointed",
+                "completed_epochs": counters.completed_epochs,
+                "current_epoch": counters.completed_epochs,
+                "total_epochs": config.epochs,
+                "global_steps": counters.global_steps,
+                "total_steps": config.epochs * TRAINING_STEPS_PER_EPOCH,
+                "training_samples": counters.training_samples,
+                "validation_samples": counters.validation_samples,
+                "validation_batches": counters.validation_batches,
+                "learning_rates": _learning_rates(optimizer),
+                "cursor": dict(cursor),
+                "checkpoint": {
+                    "path": str(checkpoint_path.absolute()),
+                    "bytes": checkpoint_path.stat().st_size,
+                },
+                "persistence_finite_audit": {
+                    "status": "passed",
+                    **finite_audit,
+                },
+                "epoch_wall_gate": epoch_wall_diagnostic,
+            },
+        )
+        if epoch_wall_rejected:
+            raise EpochWallTimeRejected(epoch_wall_diagnostic)
     _emit_progress(
         progress_callback,
         {
@@ -1207,13 +1580,16 @@ __all__ = [
     "EFFECTIVE_BATCH_SIZE",
     "EPOCHS",
     "EPOCH_SIZE",
+    "EpochWallTimeRejected",
     "EpochMetrics",
     "ExecutorError",
     "FINAL_LEARNING_RATE",
+    "HARD_MAX_TOTAL_EPOCH_SECONDS",
     "LambdaSchedule",
     "MAIN_LEARNING_RATE",
     "MICROBATCH_SIZE",
     "PRECISION",
+    "PersistenceFiniteStateError",
     "PROGRESS_INTERVAL_STEPS",
     "PreparedProductionRun",
     "ProgressCallback",
@@ -1248,6 +1624,7 @@ __all__ = [
     "validate_epoch",
     "validate_production_counters",
     "validate_production_optimizer",
+    "audit_persistence_finite_state",
     "validate_provider_canary",
     "validate_provider_identity",
 ]

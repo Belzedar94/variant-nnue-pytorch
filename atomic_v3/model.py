@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Callable, Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from .contract import (
@@ -26,7 +24,7 @@ from .contract import (
     LAYER_STACKS,
     PSQT_BUCKETS,
 )
-from .dataset import AtomicV3Batch, SparseSliceBatch, validate_batch
+from .dataset import AtomicV3Batch, validate_batch
 from .dense import AtomicV3LayerStacks, pairwise_multiply
 from .quantization import (
     FC0_BIAS_SCALE,
@@ -47,11 +45,40 @@ from .quantization import (
     PSQT_WEIGHT_SCALE,
     clip_feature_activation,
     fake_quantize_activation,
-    fake_quantize_i16_feature,
-    fake_quantize_i8_feature,
     fake_quantize_psqt_output,
     fake_quantize_psqt_weight,
 )
+from .sparse_transformer import double_sparse_linear, sparse_linear
+
+
+@torch.no_grad()
+def _clip_factorized_training_sums_(
+    base: torch.Tensor,
+    factor: torch.Tensor,
+    *,
+    count: int,
+    minimum: float,
+    maximum: float,
+    label: str,
+) -> None:
+    """Fast FP32 per-step clamp for a persisted ``base + factor``.
+
+    This deliberately performs no reductions, host synchronizations, FP64
+    widening, or production-sized ``repeat``.  The exact signed-wire audit is
+    deferred to :func:`_clip_factorized_i32_sums_` at persistence boundaries.
+    """
+
+    if base.dtype != torch.float32 or factor.dtype != torch.float32:
+        raise TypeError(f"Atomic V3 {label} factors must use float32 parameters")
+    expected_shape = (factor.shape[0] * count, *factor.shape[1:])
+    if base.shape != expected_shape or base.device != factor.device:
+        raise ValueError(f"Atomic V3 {label} factor shapes/devices are inconsistent")
+    factor.clamp_(minimum, maximum)
+    grouped_base = base.view(count, *factor.shape)
+    lower = minimum - factor
+    upper = maximum - factor
+    torch.minimum(grouped_base, upper.unsqueeze(0), out=grouped_base)
+    torch.maximum(grouped_base, lower.unsqueeze(0), out=grouped_base)
 
 
 @torch.no_grad()
@@ -174,21 +201,33 @@ def _clip_factorized_i32_biases_(
     )
 
 
-def _sparse_sum(
-    features: SparseSliceBatch,
-    weight: torch.Tensor,
-    quantize: Optional[Callable[[torch.Tensor], torch.Tensor]],
+def _fake_quantize_training_fp32(
+    value: torch.Tensor, *, scale: float, minimum: float, maximum: float
 ) -> torch.Tensor:
-    indices, values = features.indices, features.values
-    valid = indices != -1
-    safe = indices.clamp_min(0).to(torch.long)
-    # Quantize after gathering.  Besides avoiding a dense fake-quantized copy,
-    # this preserves sparse gradients for the 77,900-row production tables.
-    rows = F.embedding(safe, weight, sparse=True)
-    if quantize is not None:
-        rows = quantize(rows)
-    scales = torch.where(valid, values, torch.zeros_like(values)).unsqueeze(-1)
-    return (rows * scales).sum(dim=1)
+    """Fast float32 QAT boundary with a straight-through gradient.
+
+    The exact widening/range checks remain at the persistent clipping and
+    serialization boundaries.  The training graph only needs the quantized
+    float32 grid; promoting every active row to float64 was both unnecessary
+    and prohibitively expensive.
+    """
+
+    if value.dtype != torch.float32:
+        raise TypeError("Atomic V3 training QAT requires float32 parameters")
+    hard = value.mul(scale).round().clamp(minimum, maximum).div(scale).detach()
+    return hard + (value - value.detach())
+
+
+def _fake_quantize_i16_training(value: torch.Tensor) -> torch.Tensor:
+    return _fake_quantize_training_fp32(
+        value, scale=FT_ONE, minimum=-32768.0, maximum=32767.0
+    )
+
+
+def _fake_quantize_i8_training(value: torch.Tensor) -> torch.Tensor:
+    return _fake_quantize_training_fp32(
+        value, scale=FT_ONE, minimum=-128.0, maximum=127.0
+    )
 
 
 class AtomicV3FeatureTransformer(nn.Module):
@@ -234,87 +273,155 @@ class AtomicV3FeatureTransformer(nn.Module):
         self.hm_bucket_weight[:, ACCUMULATOR_DIMENSIONS:].zero_()
         self.hm_virtual_weight[:, ACCUMULATOR_DIMENSIONS:].zero_()
 
-    def _hm_sum(self, features: SparseSliceBatch, fake_quantize_weights: bool) -> torch.Tensor:
-        safe = features.indices.clamp_min(0).to(torch.long)
-        valid = features.indices != -1
-        bucket_rows = F.embedding(safe, self.hm_bucket_weight, sparse=True)
-        virtual_rows = F.embedding(
-            torch.remainder(safe, HM_VIRTUAL_DIMENSIONS), self.hm_virtual_weight, sparse=True
-        )
-        coalesced = bucket_rows + virtual_rows
+    def _prepared_weights(
+        self, fake_quantize_weights: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.hm_bucket_weight.shape[0] % self.hm_virtual_weight.shape[0] != 0:
+            raise ValueError("Atomic V3 HM factor shapes are inconsistent")
+        factor_count = self.hm_bucket_weight.shape[0] // self.hm_virtual_weight.shape[0]
+        hm = self.hm_bucket_weight + self.hm_virtual_weight.repeat(factor_count, 1)
+        bias = self.bias
+        capture_pair = self.capture_pair_weight
+        king_blast_ep = self.king_blast_ep_weight
+        blast_ring = self.blast_ring_weight
         if fake_quantize_weights:
-            main = fake_quantize_i16_feature(coalesced[..., :ACCUMULATOR_DIMENSIONS])
-            psqt = fake_quantize_psqt_weight(coalesced[..., ACCUMULATOR_DIMENSIONS:])
-            coalesced = torch.cat((main, psqt), dim=-1)
-        scales = torch.where(valid, features.values, torch.zeros_like(features.values)).unsqueeze(-1)
-        return (coalesced * scales).sum(dim=1)
+            hm = torch.cat(
+                (
+                    _fake_quantize_i16_training(hm[:, :ACCUMULATOR_DIMENSIONS]),
+                    # PSQT's 9600 scale is not exactly representable through
+                    # every float32 half-step.  Preserve the serializer's
+                    # float64 ties-to-even wire semantics on these 8 columns.
+                    fake_quantize_psqt_weight(hm[:, ACCUMULATOR_DIMENSIONS:]),
+                ),
+                dim=1,
+            )
+            bias = _fake_quantize_i16_training(bias)
+            capture_pair = _fake_quantize_i8_training(capture_pair)
+            king_blast_ep = _fake_quantize_i16_training(king_blast_ep)
+            blast_ring = _fake_quantize_i8_training(blast_ring)
+        hm_bias = torch.cat((bias, bias.new_zeros(PSQT_BUCKETS)), dim=0)
+        return hm, hm_bias, capture_pair, king_blast_ep, blast_ring
+
+    @staticmethod
+    def _zero_bias(weight: torch.Tensor) -> torch.Tensor:
+        return weight.new_zeros(weight.shape[1])
+
+    @staticmethod
+    def _split_hm(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return value.split((ACCUMULATOR_DIMENSIONS, PSQT_BUCKETS), dim=1)
 
     def forward(self, perspective, fake_quantize_weights: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        hm = self._hm_sum(perspective.hm, fake_quantize_weights)
-        main, psqt = hm.split((ACCUMULATOR_DIMENSIONS, PSQT_BUCKETS), dim=1)
-        bias = fake_quantize_i16_feature(self.bias) if fake_quantize_weights else self.bias
-        main = main + bias
-        main = main + _sparse_sum(
-            perspective.capture_pair,
-            self.capture_pair_weight,
-            fake_quantize_i8_feature if fake_quantize_weights else None,
+        hm_weight, hm_bias, capture_pair, king_blast_ep, blast_ring = self._prepared_weights(
+            fake_quantize_weights
         )
-        main = main + _sparse_sum(
-            perspective.king_blast_ep,
-            self.king_blast_ep_weight,
-            fake_quantize_i16_feature if fake_quantize_weights else None,
+        hm = sparse_linear(
+            perspective.hm.indices,
+            perspective.hm.values,
+            hm_weight,
+            hm_bias,
+            unit_values=True,
         )
-        main = main + _sparse_sum(
-            perspective.blast_ring,
-            self.blast_ring_weight,
-            fake_quantize_i8_feature if fake_quantize_weights else None,
-        )
+        main, psqt = self._split_hm(hm)
+        for features, weight in (
+            (perspective.capture_pair, capture_pair),
+            (perspective.king_blast_ep, king_blast_ep),
+            (perspective.blast_ring, blast_ring),
+        ):
+            main = main + sparse_linear(
+                features.indices,
+                features.values,
+                weight,
+                self._zero_bias(weight),
+                unit_values=True,
+            )
         return main, psqt
+
+    def forward_pair(
+        self, white, black, fake_quantize_weights: bool
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        """Transform both perspectives while sharing QAT and dense gradients."""
+
+        hm_weight, hm_bias, capture_pair, king_blast_ep, blast_ring = self._prepared_weights(
+            fake_quantize_weights
+        )
+        white_hm, black_hm = double_sparse_linear(
+            white.hm.indices,
+            white.hm.values,
+            black.hm.indices,
+            black.hm.values,
+            hm_weight,
+            hm_bias,
+            unit_values=True,
+        )
+        white_main, white_psqt = self._split_hm(white_hm)
+        black_main, black_psqt = self._split_hm(black_hm)
+        for white_features, black_features, weight in (
+            (white.capture_pair, black.capture_pair, capture_pair),
+            (white.king_blast_ep, black.king_blast_ep, king_blast_ep),
+            (white.blast_ring, black.blast_ring, blast_ring),
+        ):
+            white_relation, black_relation = double_sparse_linear(
+                white_features.indices,
+                white_features.values,
+                black_features.indices,
+                black_features.values,
+                weight,
+                self._zero_bias(weight),
+                unit_values=True,
+            )
+            white_main = white_main + white_relation
+            black_main = black_main + black_relation
+        return (white_main, white_psqt), (black_main, black_psqt)
+
+    @torch.no_grad()
+    def clip_training_weights(self) -> None:
+        """Clamp the QAT domain without exact wire-boundary overhead."""
+
+        i16_min, i16_max = -32768.0 / FT_ONE, 32767.0 / FT_ONE
+        i8_min, i8_max = -128.0 / FT_ONE, 127.0 / FT_ONE
+        self.bias.clamp_(i16_min, i16_max)
+        self.capture_pair_weight.clamp_(i8_min, i8_max)
+        self.king_blast_ep_weight.clamp_(i16_min, i16_max)
+        self.blast_ring_weight.clamp_(i8_min, i8_max)
+
+        if self.hm_bucket_weight.shape[0] % self.hm_virtual_weight.shape[0] != 0:
+            raise ValueError("Atomic V3 HM factor shapes are inconsistent")
+        factor_count = self.hm_bucket_weight.shape[0] // self.hm_virtual_weight.shape[0]
+        _clip_factorized_training_sums_(
+            self.hm_bucket_weight[:, :ACCUMULATOR_DIMENSIONS],
+            self.hm_virtual_weight[:, :ACCUMULATOR_DIMENSIONS],
+            count=factor_count,
+            minimum=i16_min,
+            maximum=i16_max,
+            label="HM main weight",
+        )
+        _clip_factorized_training_sums_(
+            self.hm_bucket_weight[:, ACCUMULATOR_DIMENSIONS:],
+            self.hm_virtual_weight[:, ACCUMULATOR_DIMENSIONS:],
+            count=factor_count,
+            minimum=PSQT_EXPORT_MIN,
+            maximum=PSQT_EXPORT_MAX,
+            label="HM PSQT weight",
+        )
 
     @torch.no_grad()
     def clip_weights(self) -> None:
-        i16_min, i16_max = -32768.0 / FT_ONE, 32767.0 / FT_ONE
-        i8_min, i8_max = -128.0 / FT_ONE, 127.0 / FT_ONE
-        psqt_min = PSQT_EXPORT_MIN
-        psqt_max = PSQT_EXPORT_MAX
+        """Exact persistence-boundary clamp and signed-i32 PSQT audit."""
+
         hm_psqt_base = self.hm_bucket_weight[:, ACCUMULATOR_DIMENSIONS:]
         hm_psqt_factor = self.hm_virtual_weight[:, ACCUMULATOR_DIMENSIONS:]
         if not torch.all(torch.isfinite(hm_psqt_base)) or not torch.all(
             torch.isfinite(hm_psqt_factor)
         ):
             raise FloatingPointError("Atomic V3 HM PSQT factor is non-finite")
-        self.bias.clamp_(i16_min, i16_max)
-        self.capture_pair_weight.clamp_(i8_min, i8_max)
-        self.king_blast_ep_weight.clamp_(i16_min, i16_max)
-        self.blast_ring_weight.clamp_(i8_min, i8_max)
-
-        # The wire stores bucket+virtual, so clipping either factor alone is
-        # insufficient.  Process one king bucket at a time to avoid a second
-        # production-size tensor.
-        self.hm_virtual_weight[:, :ACCUMULATOR_DIMENSIONS].clamp_(i16_min, i16_max)
-        self.hm_virtual_weight[:, ACCUMULATOR_DIMENSIONS:].clamp_(psqt_min, psqt_max)
-        if self.hm_bucket_weight.shape[0] % self.hm_virtual_weight.shape[0] != 0:
-            raise ValueError("Atomic V3 HM factor shapes are inconsistent")
-        factor_rows = self.hm_virtual_weight.shape[0]
-        factor_count = self.hm_bucket_weight.shape[0] // factor_rows
-        for bucket in range(factor_count):
-            begin, end = bucket * factor_rows, (bucket + 1) * factor_rows
-            base = self.hm_bucket_weight[begin:end]
-            virtual = self.hm_virtual_weight
-            base_main = base[:, :ACCUMULATOR_DIMENSIONS]
-            virtual_main = virtual[:, :ACCUMULATOR_DIMENSIONS]
-            base_main.copy_(
-                torch.maximum(
-                    torch.minimum(base_main, base_main.new_tensor(i16_max) - virtual_main),
-                    base_main.new_tensor(i16_min) - virtual_main,
-                )
-            )
+        self.clip_training_weights()
+        factor_count = self.hm_bucket_weight.shape[0] // self.hm_virtual_weight.shape[0]
         _clip_factorized_i32_sums_(
             hm_psqt_base,
             hm_psqt_factor.repeat(factor_count, 1),
             scale=PSQT_WEIGHT_SCALE,
-            minimum=psqt_min,
-            maximum=psqt_max,
+            minimum=PSQT_EXPORT_MIN,
+            maximum=PSQT_EXPORT_MAX,
             label="HM PSQT weight",
         )
 
@@ -365,18 +472,16 @@ class AtomicNNUEV3(nn.Module):
         )
 
     @torch.no_grad()
-    def clip_weights(self) -> None:
-        self.feature_transformer.clip_weights()
+    def _clip_training_dense_weights(self) -> None:
         fc0_limit = 127.0 / FC0_WEIGHT_SCALE
         fc0_factor = self.network.fc0.factorized_linear.weight
-        fc0_factor.clamp_(-fc0_limit, fc0_limit)
-        virtual = fc0_factor.repeat(LAYER_STACKS, 1)
-        base = self.network.fc0.linear.weight
-        base.copy_(
-            torch.maximum(
-                torch.minimum(base, base.new_full((), fc0_limit) - virtual),
-                base.new_full((), -fc0_limit) - virtual,
-            )
+        _clip_factorized_training_sums_(
+            self.network.fc0.linear.weight,
+            fc0_factor,
+            count=LAYER_STACKS,
+            minimum=-fc0_limit,
+            maximum=fc0_limit,
+            label="FC0 weight",
         )
         self.network.fc1.linear.weight.clamp_(
             -127.0 / FC1_WEIGHT_SCALE, 127.0 / FC1_WEIGHT_SCALE
@@ -384,10 +489,28 @@ class AtomicNNUEV3(nn.Module):
         self.network.fc2.linear.weight.clamp_(
             -127.0 / FC2_WEIGHT_SCALE, 127.0 / FC2_WEIGHT_SCALE
         )
+        _clip_factorized_training_sums_(
+            self.network.fc0.linear.bias,
+            self.network.fc0.factorized_linear.bias,
+            count=LAYER_STACKS,
+            minimum=FC0_BIAS_EXPORT_MIN,
+            maximum=FC0_BIAS_EXPORT_MAX,
+            label="FC0 bias",
+        )
+        self.network.fc1.linear.bias.clamp_(FC1_BIAS_EXPORT_MIN, FC1_BIAS_EXPORT_MAX)
+        self.network.fc2.linear.bias.clamp_(FC2_BIAS_EXPORT_MIN, FC2_BIAS_EXPORT_MAX)
 
-        # The dense wire stores signed-i32 biases.  FC0 is factorized during
-        # training but serialized as base+factor, so constrain the coalesced
-        # value rather than merely clipping each factor independently.
+    @torch.no_grad()
+    def clip_training_weights(self) -> None:
+        """Low-overhead clamp intended for every optimizer step."""
+
+        self.feature_transformer.clip_training_weights()
+        self._clip_training_dense_weights()
+
+    @torch.no_grad()
+    def clip_weights(self) -> None:
+        """Exact checkpoint/export clamp with signed-wire verification."""
+
         dense_biases = (
             ("FC0 base", self.network.fc0.linear.bias),
             ("FC0 factor", self.network.fc0.factorized_linear.bias),
@@ -397,7 +520,12 @@ class AtomicNNUEV3(nn.Module):
         for name, bias in dense_biases:
             if not torch.all(torch.isfinite(bias)):
                 raise FloatingPointError(f"Atomic V3 {name} bias is non-finite")
+        self.feature_transformer.clip_weights()
+        self._clip_training_dense_weights()
 
+        # The dense wire stores signed-i32 biases.  FC0 is factorized during
+        # training but serialized as base+factor, so constrain the coalesced
+        # value rather than merely clipping each factor independently.
         _clip_factorized_i32_biases_(
             self.network.fc0.linear.bias,
             self.network.fc0.factorized_linear.bias,
@@ -419,11 +547,8 @@ class AtomicNNUEV3(nn.Module):
     ) -> torch.Tensor:
         if validate:
             validate_batch(batch)
-        white_main, white_psqt = self.feature_transformer.forward(
-            batch.white, fake_quantize_weights
-        )
-        black_main, black_psqt = self.feature_transformer.forward(
-            batch.black, fake_quantize_weights
+        (white_main, white_psqt), (black_main, black_psqt) = self.feature_transformer.forward_pair(
+            batch.white, batch.black, fake_quantize_weights
         )
         white_bucket = white_psqt.gather(1, batch.bucket_indices.reshape(-1, 1))
         black_bucket = black_psqt.gather(1, batch.bucket_indices.reshape(-1, 1))
@@ -444,4 +569,5 @@ class AtomicNNUEV3(nn.Module):
             batch.bucket_indices,
             fake_quantize_activations,
             fake_quantize_weights,
+            validate_bucket_range=False,
         ) + positional

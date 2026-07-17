@@ -11,7 +11,8 @@ equivalence treats 20,000,000 training positions and 1,000,000 validation
 positions as requested minima and yields complete logical batches: 1,221
 training steps (20,004,864 accepted positions) and 62 validation batches
 (1,015,808 accepted positions) per epoch. The effective batch is 16,384, formed
-from exactly 128 microbatches of 128. Seed 42, random skip 3 for both roles,
+from one physical CUDA batch of 16,384. Seed 42, random skip 3 for training
+and no random skip for validation,
 fp32, one GPU, one torch thread and one provider worker are fixed. The linear
 schedule includes both advertised endpoints: epoch 0 is 0.15 and epoch 36 is
 0.5.
@@ -21,24 +22,24 @@ parameters except FC2 use learning rate `1.5e-3`; FC2 uses `1.5e-4`. Its betas
 are `(0.9, 0.999)`, epsilon `1e-7`, Lookahead alpha `0.5`, `k=6`,
 `N_sma_threshold=5`, no weight decay and no gradient centralization.
 `StepLR(gamma=0.987, step_size=1)` advances once after each completed epoch.
-Sparse table gradients are coalesced after each microbatch and densified once
-immediately before Ranger. A microbatch mean is multiplied by
-`microbatch_samples / effective_step_samples`. Every one of the 128
-microbatches in an optimizer step must contain exactly 128 positions.
+The proven CUDA feature-transformer kernel produces dense table gradients
+directly; no sparse-gradient coalescing occurs in the hot path. A batch mean is multiplied by
+`physical_batch_samples / effective_step_samples`. The normal production path
+uses one 16,384-position physical batch per optimizer step.
 
 The training provider owns one continuous cyclic logical cursor. The executor
 does not recreate or reset it at epoch boundaries. Validation uses a fresh
 provider restored to the identical authenticated zero cursor every epoch; it
-never inherits training state and repeats the same seed-42, skip-3 accepted
+never inherits training state and repeats the same seed-42, zero-skip accepted
 prefix.
 
 `prepare_production_run` is the only normative construction path. It calls
-`seed_training(42)` before constructing the model or either provider, performs
-one complete semantic canary batch per role, restores both cursors exactly to
-canonical zero, and records the model/cursor hashes in the checkpoint
-configuration. Per-microbatch execution performs only shape/sample-count
+`seed_training(42)` before constructing the model or either provider, checks
+the complete ABI/shape plus a bounded 64-position semantic CPU sample per role,
+restores both cursors exactly to canonical zero, and records the model/cursor
+hashes in the checkpoint configuration. Per-batch execution performs only shape/sample-count
 checks; expensive board reconstruction never runs in the CUDA hot path.
-The historical physical microbatch remains fixed at 128; progress reporting
+The physical CUDA batch is fixed at the proven historical value 16,384; progress reporting
 does not change the accumulation contract.
 
 ## Checkpoints and final artifacts
@@ -78,16 +79,48 @@ and completion boundaries, `status.json` is atomically replaced. It records
 epoch/global steps, accepted training and validation samples, lambda, learning
 rates, the committed native cursor, UTC timestamps, invocation throughput and
 ETA. Epoch checkpoint records also include train/validation losses. The hot
-path reads only integer counters and the committed native cursor; it never
-copies a loss tensor to the host or introduces a per-microbatch CUDA
-synchronization.
+path reads only integer counters and the committed native cursor. Every 32
+steps it reduces accumulated loss and all gradients to one finite/not-finite
+boolean and performs one bounded host synchronization; there is no
+per-microbatch synchronization or full loss transfer.
 
 ## Production CLI
 
 `train_atomic_v3.py` authenticates the bootstrap receipt and its 29+1
-manifest/evidence closure, loads the provider DLL by an explicit path, and
-calls `prepare_production_run` then `run_production`. After epoch 37 it invokes
-the strict serializer exactly once. The four-run form is:
+manifest/evidence closure and loads the provider DLL by an explicit path. It
+then performs a mandatory same-process preflight with exactly five warm-up and
+ten measured ephemeral optimizer steps. The first cold provider authentication
+is retained and amortized across the expected shard authentications per epoch.
+The gate reports training-only time separately and reserves 60 seconds for
+validation/checkpoint work: 300 seconds is the conservative total target and a
+total above 600 seconds is a hard rejection. `--preflight-only` emits the full
+machine-readable gate report while starting zero epochs and checkpoints.
+
+Only an accepted gate may create campaign directories. Its mutated model and
+provider are discarded before a fresh `prepare_production_run` enters the
+campaign. During training, cumulative 32-step wall measurements cover the
+provider and GPU path but exclude progress, validation, and checkpoint pauses;
+the breaker waits for one accepted-sample shard span before evaluating. The
+preflight cold-shard exclusion is applied only when the actual starting cursor
+leaves staging for the first timed fetch; a nonzero restored record cursor has
+already staged its shard and therefore receives no exclusion. A rejected
+heartbeat is persisted with its reason and measured samples before the
+exception stops execution.
+
+A second, non-projected gate measures each complete epoch from immediately
+before `train_epoch` through exact clipping, validation, scheduler update,
+checkpoint replacement and the checkpoint status write. If that real wall time
+exceeds 600 seconds, the valid just-written checkpoint is preserved for resume,
+the rejection diagnostic is persisted, and the next epoch is not started.
+
+Immediately before constructing or replacing `last.ckpt`, a once-per-epoch
+persistence audit scans every floating model parameter and buffer plus every
+floating tensor nested in Ranger state, including `exp_avg` and `exp_avg_sq`.
+The flags are reduced on-device to one scalar host synchronization on the
+single-device production path. Any NaN or infinity rejects before checkpoint
+replacement, so an existing valid `last.ckpt` remains byte-identical.
+
+After epoch 37 the strict serializer is invoked exactly once. The four-run form is:
 
 The native binding canonicalizes that explicit path and binds it to the
 SHA-256 measured both before and after `CDLL` loading. A process-wide lock

@@ -77,6 +77,21 @@ pinned receipt, all 30 ordered manifest byte snapshots and the semantic JSONL
 on every provider creation. Manifest and shard path, digest and filesystem
 identity reuse across the 29+1 roles is rejected.
 
+The native bootstrap provider's record loop is intentionally a structural-only
+hot path. It is not a general Atomic BIN V2 trust entrypoint and it does not
+repeat C1's legal-move generation, semantic re-encode or aggregate semantic
+audit for every training epoch. The supported production entry, `execute_runs`,
+reaches `_provider_factory` only after obtaining a `BootstrapReceiptSnapshot`
+from `inspect_bootstrap_roles`. That inspection authenticates the semantic JSONL,
+binds its domain to the exact ordered manifest/shard selection and reconciles
+the cross-chunk audit before any provider factory is constructed. The native
+loop then authenticates source and snapshot bytes, applies deterministic skip
+before decode, structurally decodes retained records, checks the Atomic960 role
+flag and emits the V3 feature refresh. Removing or bypassing the receipted
+semantic evidence would invalidate this optimization. As elsewhere in this
+boundary, arbitrary same-process Python remains trusted and `_provider_factory`
+is internal rather than an unforgeable capability.
+
 The isolated backend remains import-compatible with CPython 3.9 through 3.12.
 Its runtime modules avoid PEP 604 unions and dataclass options introduced after
 3.9; CI compiles and imports every `atomic_v3` module at each supported minor.
@@ -90,14 +105,16 @@ signed-i32 values represented in the float32 training tensor.
 
 ## Bootstrap sequential provider
 
-`atomic_v3.native_provider` is the deliberately conservative provider for the
-first 29-train/1-validation bootstrap selection. It uses the native C1 Atomic
-BIN V2 reader pinned through the `420c9f352` engine submodule. There is no
-random-access index, block shuffle, PRP, smart filter, loader auto-detection or
-background worker pool. One synchronous native worker walks manifests, shards
-and records in authenticated order and emits exact local V3 indices from
-`emit_full_refresh` for both king perspectives. The executor owns any effective
-batch accumulation; the provider's default transfer microbatch is 128.
+`atomic_v3.native_provider` is the receipt-gated sequential provider for the
+first 29-train/1-validation bootstrap selection. Its native hot path uses the
+wire and V3 refresh code pinned through the `34a1e71ce` engine submodule, while
+semantic authority comes from the authenticated bootstrap evidence described
+above. There is no random-access index, block shuffle, PRP, smart filter, loader
+auto-detection or background worker pool. One synchronous native worker walks
+manifests, shards and raw record blocks in authenticated order and emits exact
+local V3 indices from `emit_full_refresh` for both king perspectives. The
+executor owns any effective batch accumulation; the provider's default physical
+CUDA batch is 16,384.
 
 Training is one continuously living cyclic stream. Crossing the final training
 manifest increments its logical epoch and continues at the first manifest; a
@@ -107,12 +124,10 @@ from its fixed initial cursor before each validation pass. For the bootstrap
 run, the executor takes the fixed one-million-accepted-position prefix from the
 dedicated validation manifest.
 
-The only sample selector is deterministic random FEN skipping with the
+The only training sample selector is deterministic random FEN skipping with the
 historical default `random_fen_skipping=3` (one record retained in expectation
-out of four) for both roles. Validation requests one million *accepted*
-positions, so it normally reads about four million raw records; it does not
-shrink to 250,000 positions. Resetting its seed and raw cursor reproduces the
-same accepted million exactly. The old trainer's nominal filtered/smart-FEN
+out of four). Validation uses zero random skip and requests the same fixed
+one-million-position prefix on every epoch. The old trainer's nominal filtered/smart-FEN
 path is intentionally not reproduced because its `do_filter()` implementation
 returned false for all records. Adding a new position filter here would
 silently change the historical sampling policy.
@@ -125,20 +140,29 @@ manifest hashes/counts plus batch size, skip value, seed and cyclic role, so an
 exact resume cannot be applied to a different provider contract. Training
 reset is rejected; validation reset is explicit.
 
-At each manifest boundary the provider re-reads and hashes the exact immutable
-manifest bytes before C1 resolves any shard. C1 then copies, hashes and decodes
-only the current shard through its private auto-deleting snapshot. This snapshot
-is required security state, not an extra dataset cache: no persistent provider
-copy is created, completed/error/destroyed readers close it, and at most one
-snapshot is live. A production 12.5-million-record shard occupies
+At provider creation the native boundary re-reads the canonical manifests,
+matches them to the immutable supplied payloads and hashes, rejects duplicate
+pathnames or filesystem identities and captures each source identity without
+retaining its handle. Each shard visit then verifies that identity, copies and
+hashes only the current shard into a private auto-deleting snapshot, verifies
+the source change token and pathname again, and independently re-hashes the
+snapshot before exposing a raw block. Resume stages the current shard once and
+seeks directly to its record offset; it never semantically replays the prefix.
+This snapshot is required security state, not an extra dataset cache: no
+persistent provider copy is created, transitions/errors/destruction close it,
+and at most one snapshot is live. Linux creates the descriptor with
+`mkostemp(..., O_CLOEXEC)` so it is non-inheritable atomically; unsupported
+POSIX targets fail closed instead of using the racy `mkstemp` then `fcntl`
+sequence. A production 12.5-million-record shard occupies
 `96 + 12,500,000 * 64 = 800,000,096` bytes (about 763 MiB), which is therefore
 the provider's peak temporary-disk requirement independent of whether the
 authenticated source lives on another volume.
 
-The controlled optimizer helper clips immediately before the forward and
-immediately after the update. Mixed i16/i8 tables, the inward float32-safe PSQT
-i32 envelope, all dense signed-i32 biases and both HM/FC0 factor sums are
-therefore exportable at every persistent step boundary. FC0 bias and weight
+The optimizer applies an asynchronous FP32 range clamp after each update.
+Exact finite/float64/signed-i32 verification runs once at the epoch persistence
+boundary, before validation and checkpoint publication. Mixed i16/i8 tables,
+the inward float32-safe PSQT i32 envelope, all dense signed-i32 biases and both
+HM/FC0 factor sums are therefore exportable at every persistent boundary. FC0 bias and weight
 limits apply to the serialized base+factor value, not just to each training
 factor independently. FC0 biases and factorized HM PSQT weights are coalesced
 and saturated in float64, written back as coordinated float32 operands, and

@@ -30,6 +30,7 @@ from atomic_v3.checkpoint import (
 )
 from atomic_v3.dataset import (
     AtomicV3Batch,
+    DatasetContractError,
     PerspectiveBatch,
     RoleManifest,
     SparseSliceBatch,
@@ -64,6 +65,12 @@ from atomic_v3.executor import (
     validate_production_counters,
     validate_production_optimizer,
 )
+from atomic_v3.performance_gate import (
+    CumulativePerformanceGate,
+    PerformanceGatePolicy,
+    PerformanceGateRejected,
+    StepMeasurement,
+)
 from ranger import Ranger
 import train_atomic_v3
 import scripts.canary_atomic_v3_production as canary_module
@@ -78,8 +85,8 @@ class FakeProvider:
         self.records = tuple((float(x), float(y)) for x, y in records)
         self.cap = cap
         self.role = role
-        self.batch_size = 128
-        self.random_fen_skipping = 3
+        self.batch_size = MICROBATCH_SIZE
+        self.random_fen_skipping = 3 if role == "train" else 0
         self.seed = 42
         self.native_workers = 1
         self.cyclic = role == "train"
@@ -133,7 +140,11 @@ class FakeProvider:
         pass
 
 
-def _repeat_batch(batch, copies=64):
+def _repeat_batch(batch, copies=None):
+    if copies is None:
+        assert MICROBATCH_SIZE % batch.batch_size == 0
+        copies = MICROBATCH_SIZE // batch.batch_size
+
     def repeat(tensor):
         return tensor.repeat((copies,) + (1,) * (tensor.ndim - 1))
 
@@ -334,7 +345,7 @@ def test_four_run_contract_and_inclusive_lambda_endpoints():
         assert config.epoch_size == EPOCH_SIZE == 20_000_000
         assert config.validation_size == VALIDATION_SIZE == 1_000_000
         assert config.effective_batch_size == EFFECTIVE_BATCH_SIZE == 16_384
-        assert MICROBATCH_SIZE == 128
+        assert MICROBATCH_SIZE == 16_384
         assert TRAINING_STEPS_PER_EPOCH == 1221
         assert TRAINING_SAMPLES_PER_EPOCH == 20_004_864
         assert VALIDATION_BATCHES_PER_EPOCH == 62
@@ -346,8 +357,8 @@ def test_four_run_contract_and_inclusive_lambda_endpoints():
         assert config.lambda_schedule.value(0) == endpoints[0]
         assert config.lambda_schedule.value(36) == endpoints[1]
         document = config.to_document()
-        assert document["microbatch_size"] == 128
-        assert document["accumulation_steps"] == 128
+        assert document["microbatch_size"] == 16_384
+        assert document["accumulation_steps"] == 1
         assert document["progress_interval_steps"] == PROGRESS_INTERVAL_STEPS == 32
         assert document["training_steps_per_epoch"] == 1221
         assert document["training_samples_accepted_per_epoch"] == 20_004_864
@@ -386,6 +397,35 @@ def test_microbatches_are_weighted_to_the_exact_effective_batch():
     assert provider.logical_cursor_state()["accepted_samples"] == 5
 
 
+def test_training_uses_fast_clip_when_model_exposes_one():
+    class FastClipModel(nn.Linear):
+        def __init__(self):
+            super().__init__(1, 1, bias=False)
+            self.fast_clips = 0
+            self.exact_clips = 0
+
+        def clip_training_weights(self):
+            self.fast_clips += 1
+
+        def clip_weights(self):
+            self.exact_clips += 1
+
+    model = FastClipModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    train_epoch(
+        model,
+        optimizer,
+        FakeProvider([(1, 1)]),
+        lambda_value=0.0,
+        sample_budget=2,
+        effective_batch_size=2,
+        microbatch_size=2,
+        loss_function=mse_loss,
+    )
+    assert model.fast_clips == 1
+    assert model.exact_clips == 0
+
+
 def test_training_heartbeat_observes_only_committed_step_counters():
     model = nn.Linear(1, 1, bias=False)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -408,6 +448,197 @@ def test_training_heartbeat_observes_only_committed_step_counters():
     assert metrics.steps == 3
     assert [(steps, samples) for steps, samples, _ in events] == [(2, 8), (3, 10)]
     assert [cursor["accepted_samples"] for _, _, cursor in events] == [8, 10]
+
+
+def test_finite_sentinel_runs_only_at_32_step_heartbeats(monkeypatch):
+    model = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    calls = []
+    original = executor_module._heartbeat_finite_sentinel
+
+    def sentinel(model, weighted_loss):
+        calls.append(True)
+        return original(model, weighted_loss)
+
+    monkeypatch.setattr(executor_module, "_heartbeat_finite_sentinel", sentinel)
+    events = []
+    train_epoch(
+        model,
+        optimizer,
+        FakeProvider([(1, 1)]),
+        lambda_value=0.0,
+        sample_budget=65,
+        effective_batch_size=1,
+        microbatch_size=1,
+        loss_function=mse_loss,
+        progress_callback=lambda steps, *_args: events.append(steps),
+        progress_interval_steps=32,
+    )
+
+    assert events == [32, 64, 65]
+    assert len(calls) == 3
+
+
+def test_nonfinite_gradient_aborts_at_heartbeat_before_next_chunk():
+    model = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    provider = FakeProvider([(1, 1)])
+
+    def nonfinite_loss(model, payload, _lambda):
+        return mse_loss(model, payload, 0.0) * torch.tensor(float("nan"))
+
+    with pytest.raises(FloatingPointError, match="non-finite loss or gradient"):
+        train_epoch(
+            model,
+            optimizer,
+            provider,
+            lambda_value=0.0,
+            sample_budget=5,
+            effective_batch_size=1,
+            microbatch_size=1,
+            loss_function=nonfinite_loss,
+            progress_interval_steps=2,
+        )
+
+    assert provider.logical_cursor_state()["accepted_samples"] == 2
+
+
+class _FakeHeartbeatClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def test_runtime_breaker_rejects_cumulative_training_before_next_chunk():
+    model = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    provider = FakeProvider([(1, 1)])
+    clock = _FakeHeartbeatClock()
+    gate = CumulativePerformanceGate(
+        PerformanceGatePolicy(
+            epoch_samples=100,
+            warmup_steps=0,
+            minimum_measured_steps=1,
+            rolling_window_steps=1,
+            target_total_epoch_seconds=5.0,
+            hard_max_total_epoch_seconds=10.0,
+            non_training_reserve_seconds=0.0,
+        ),
+        minimum_measured_samples=2,
+    )
+
+    def timed_loss(model, payload, lambda_value):
+        clock.advance(1.0)
+        return mse_loss(model, payload, lambda_value)
+
+    reported = []
+    with pytest.raises(PerformanceGateRejected):
+        train_epoch(
+            model,
+            optimizer,
+            provider,
+            lambda_value=0.0,
+            sample_budget=5,
+            effective_batch_size=1,
+            microbatch_size=1,
+            loss_function=timed_loss,
+            progress_interval_steps=2,
+            performance_gate=gate,
+            heartbeat_clock=clock,
+            progress_callback=lambda *_args: reported.append(gate.decision),
+        )
+
+    assert provider.logical_cursor_state()["accepted_samples"] == 2
+    assert gate.tripped
+    assert len(reported) == 1
+    assert reported[0].rejected
+    assert reported[0].metrics.samples == 2
+
+
+def test_runtime_measurement_excludes_progress_pause_but_includes_train_path():
+    model = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    clock = _FakeHeartbeatClock()
+    gate = CumulativePerformanceGate(
+        PerformanceGatePolicy(
+            epoch_samples=4,
+            warmup_steps=0,
+            minimum_measured_steps=1,
+            rolling_window_steps=1,
+            target_total_epoch_seconds=10.0,
+            hard_max_total_epoch_seconds=20.0,
+            non_training_reserve_seconds=0.0,
+        ),
+        minimum_measured_samples=2,
+    )
+
+    def timed_loss(model, payload, lambda_value):
+        clock.advance(1.0)
+        return mse_loss(model, payload, lambda_value)
+
+    train_epoch(
+        model,
+        optimizer,
+        FakeProvider([(1, 1)]),
+        lambda_value=0.0,
+        sample_budget=4,
+        effective_batch_size=1,
+        microbatch_size=1,
+        loss_function=timed_loss,
+        progress_callback=lambda *_args: clock.advance(100.0),
+        progress_interval_steps=2,
+        performance_gate=gate,
+        heartbeat_clock=clock,
+    )
+
+    assert gate.decision.metrics.elapsed_seconds == pytest.approx(4.0)
+    assert gate.decision.metrics.estimated_training_seconds == pytest.approx(4.0)
+
+
+def test_cold_exclusion_applies_to_fresh_fetch_but_not_nonzero_resume():
+    policy = PerformanceGatePolicy(
+        epoch_samples=100,
+        warmup_steps=0,
+        minimum_measured_steps=1,
+        rolling_window_steps=1,
+        target_total_epoch_seconds=100.0,
+        hard_max_total_epoch_seconds=200.0,
+        non_training_reserve_seconds=0.0,
+        elapsed_exclusion_seconds=60.0,
+    )
+    fresh_cursor = {
+        "record_index": 0,
+        "accepted_samples": 0,
+        "eof": False,
+    }
+    resumed_cursor = {
+        "record_index": 123_456,
+        "accepted_samples": 20_004_864,
+        "eof": False,
+    }
+
+    fresh, fresh_stages = executor_module._campaign_performance_gate_for_cursor(
+        policy, minimum_measured_samples=100, cursor=fresh_cursor
+    )
+    resumed, resumed_stages = executor_module._campaign_performance_gate_for_cursor(
+        policy, minimum_measured_samples=100, cursor=resumed_cursor
+    )
+
+    assert fresh_stages is True
+    assert fresh.policy.elapsed_exclusion_seconds == pytest.approx(60.0)
+    assert resumed_stages is False
+    assert resumed.policy.elapsed_exclusion_seconds == pytest.approx(0.0)
+    fresh_decision = fresh.observe(StepMeasurement(samples=100, elapsed_seconds=70.0))
+    resumed_decision = resumed.observe(
+        StepMeasurement(samples=100, elapsed_seconds=10.0)
+    )
+    assert fresh_decision.metrics.estimated_training_seconds == pytest.approx(10.0)
+    assert resumed_decision.metrics.estimated_training_seconds == pytest.approx(10.0)
 
 
 class SparseModel(nn.Module):
@@ -666,16 +897,16 @@ def test_dry_run_cli_validates_without_starting_training(tmp_path, monkeypatch):
         bootstrap_source=[str(snapshot.receipt_path), SHA_A],
         output_dir=str(tmp_path / "checkpoints-on-any-volume"),
         trainer_commit="d" * 40,
-        microbatch_size=128,
+        microbatch_size=MICROBATCH_SIZE,
         dry_run=True,
     )
     document = train_atomic_v3.dry_run_document(arguments)
     assert document["status"] == "validated-dry-run"
     assert document["training_started"] is False
-    assert document["microbatch_size"] == 128
+    assert document["microbatch_size"] == MICROBATCH_SIZE
     assert document["config"] == production_config(
         "lambda-linear-015-050"
-    ).to_document(microbatch_size=128)
+    ).to_document(microbatch_size=MICROBATCH_SIZE)
     assert document["dataset"]["dataset_publication_ready"] is False
     assert document["dataset"]["release_candidate_eligible"] is False
 
@@ -699,16 +930,16 @@ def test_cli_refuses_non_dry_execution_before_touching_dataset():
 
 
 def test_cli_rejects_non_historical_bootstrap_microbatch():
-    with pytest.raises(argparse.ArgumentTypeError, match="exactly 128"):
+    with pytest.raises(argparse.ArgumentTypeError, match="exactly 16384"):
         train_atomic_v3._positive_microbatch("2048")
 
 
 def test_skip_three_and_full_historical_ranger_are_frozen():
     document = production_config("lambda-025").to_document()
     assert document["random_skip"] == 3
-    assert document["validation_random_skip"] == 3
+    assert document["validation_random_skip"] == 0
     assert document["dataset"]["training_random_skip"] == 3
-    assert document["dataset"]["validation_random_skip"] == 3
+    assert document["dataset"]["validation_random_skip"] == 0
     assert document["optimizer"]["n_sma_threshold"] == 5
 
 
@@ -716,15 +947,15 @@ def test_default_hot_loss_disables_semantic_validation(monkeypatch):
     monkeypatch.setattr(executor_module, "AtomicNNUEV3", TinyAtomicModel)
     calls = []
 
-    def frozen_loss(model, payload, *, lambda_, validate):
-        calls.append((model, payload, lambda_, validate))
+    def frozen_loss(model, payload, *, lambda_, validate, check_finite):
+        calls.append((model, payload, lambda_, validate, check_finite))
         return torch.tensor(0.25)
 
     monkeypatch.setattr(executor_module, "batch_loss", frozen_loss)
     model = TinyAtomicModel()
     payload = load_canonical_fixture().batch("train")
     assert float(executor_module._default_loss(model, payload, 0.5)) == 0.25
-    assert calls == [(model, payload, 0.5, False)]
+    assert calls == [(model, payload, 0.5, False, False)]
     assert "loss_function" not in inspect.signature(run_production).parameters
 
 
@@ -891,6 +1122,73 @@ def _prepared_tiny_run(monkeypatch, events=None):
     return prepared, shared
 
 
+def test_provider_canary_semantically_reconstructs_only_a_bounded_cpu_sample(
+    monkeypatch,
+):
+    fixture = _repeat_batch(load_canonical_fixture().batch("train"))
+    provider = CanaryProvider(fixture, role="train")
+    observed = []
+    real_validate = executor_module.validate_batch
+
+    def bounded_validate(batch):
+        observed.append((batch.batch_size, batch.side_to_move_white.device.type))
+        return real_validate(batch)
+
+    monkeypatch.setattr(executor_module, "validate_batch", bounded_validate)
+    initial = executor_module.validate_provider_canary(
+        provider, role="train", config=production_config("lambda-0")
+    )
+    assert observed == [(executor_module.CANARY_SEMANTIC_SAMPLES, "cpu")]
+    assert provider.logical_cursor_state() == initial
+
+
+def test_provider_canary_rejects_full_batch_tail_truncation_before_sampling():
+    fixture = _repeat_batch(load_canonical_fixture().batch("train"))
+    relation = fixture.black.blast_ring
+    truncated = SparseSliceBatch(relation.indices[:64], relation.values[:64])
+    black = replace(fixture.black, blast_ring=truncated)
+    provider = CanaryProvider(replace(fixture, black=black), role="train")
+    with pytest.raises(DatasetContractError, match=r"equal \[batch, width\] shape"):
+        executor_module.validate_provider_canary(
+            provider, role="train", config=production_config("lambda-0")
+        )
+
+
+def test_provider_canary_rejects_wrong_full_batch_dtype_before_sampling():
+    fixture = _repeat_batch(load_canonical_fixture().batch("train"))
+    provider = CanaryProvider(
+        replace(fixture, outcome=fixture.outcome.to(torch.float64)), role="train"
+    )
+    with pytest.raises(DatasetContractError, match="outcome and score must use float32"):
+        executor_module.validate_provider_canary(
+            provider, role="train", config=production_config("lambda-0")
+        )
+
+
+def test_provider_canary_rejects_mixed_tensor_devices_before_sampling():
+    fixture = _repeat_batch(load_canonical_fixture().batch("train"))
+    other_device = "cuda" if torch.cuda.is_available() else "meta"
+    wrong_device_score = torch.empty_like(fixture.score, device=other_device)
+    provider = CanaryProvider(
+        replace(fixture, score=wrong_device_score), role="train"
+    )
+    with pytest.raises(DatasetContractError, match="tensors must share one device"):
+        executor_module.validate_provider_canary(
+            provider, role="train", config=production_config("lambda-0")
+        )
+
+
+def test_provider_canary_semantic_sample_includes_the_last_row():
+    fixture = _repeat_batch(load_canonical_fixture().batch("train"))
+    outcomes = fixture.outcome.clone()
+    outcomes[-1] = 0.25
+    provider = CanaryProvider(replace(fixture, outcome=outcomes), role="train")
+    with pytest.raises(DatasetContractError, match="exactly one of"):
+        executor_module.validate_provider_canary(
+            provider, role="train", config=production_config("lambda-0")
+        )
+
+
 def test_preparation_seeds_before_model_and_providers_and_loads_shared_init(monkeypatch):
     events = []
     first, shared = _prepared_tiny_run(monkeypatch, events)
@@ -976,3 +1274,129 @@ def test_run_production_end_to_end_validates_complete_resume_without_gpu_full_ru
     assert prepared.training_provider.logical_cursor_state() == cursor
     assert [event["event"] for event in progress] == ["run-ready", "run-complete"]
     assert all(event["global_steps"] == counters.global_steps for event in progress)
+
+
+@pytest.mark.parametrize(
+    ("epoch_seconds", "expect_rejected"),
+    [(600.0, False), (600.001, True)],
+)
+def test_full_epoch_wall_gate_checkpoints_then_continues_or_rejects(
+    tmp_path, monkeypatch, epoch_seconds, expect_rejected
+):
+    prepared, _ = _prepared_tiny_run(monkeypatch)
+    monkeypatch.setattr(executor_module, "require_production_model", lambda _model: None)
+    binding = _binding(tmp_path, prepared.checkpoint_config_document())
+    train_calls = []
+
+    class SecondEpochStarted(RuntimeError):
+        pass
+
+    def fake_train(_model, _optimizer, provider, **_kwargs):
+        train_calls.append(True)
+        if len(train_calls) > 1:
+            raise SecondEpochStarted
+        provider.cursor += TRAINING_SAMPLES_PER_EPOCH
+        provider.batch_sequence += TRAINING_STEPS_PER_EPOCH
+        return executor_module.EpochMetrics(
+            TRAINING_SAMPLES_PER_EPOCH, TRAINING_STEPS_PER_EPOCH, 0.25
+        )
+
+    def fake_validation(*_args, **_kwargs):
+        return executor_module.EpochMetrics(
+            VALIDATION_SAMPLES_PER_EPOCH, VALIDATION_BATCHES_PER_EPOCH, 0.30
+        )
+
+    monkeypatch.setattr(executor_module, "train_epoch", fake_train)
+    monkeypatch.setattr(executor_module, "validate_epoch", fake_validation)
+    timestamps = iter([0.0, epoch_seconds, epoch_seconds + 1.0])
+    progress = []
+
+    if expect_rejected:
+        with pytest.raises(executor_module.EpochWallTimeRejected) as raised:
+            run_production(
+                prepared,
+                binding,
+                str(tmp_path),
+                progress_callback=progress.append,
+                epoch_wall_clock=lambda: next(timestamps),
+            )
+        assert raised.value.diagnostic["status"] == "rejected"
+        assert len(train_calls) == 1
+    else:
+        with pytest.raises(SecondEpochStarted):
+            run_production(
+                prepared,
+                binding,
+                str(tmp_path),
+                progress_callback=progress.append,
+                epoch_wall_clock=lambda: next(timestamps),
+            )
+        assert len(train_calls) == 2
+
+    checkpoint = load_last_checkpoint(tmp_path, binding)
+    saved = TrainingCounters.from_document(checkpoint["counters"])
+    assert saved.completed_epochs == 1
+    gate_events = [event for event in progress if event["event"] == "epoch-wall-gate"]
+    assert len(gate_events) == 1
+    diagnostic = gate_events[0]["epoch_wall_gate"]
+    assert diagnostic["status"] == ("rejected" if expect_rejected else "accepted")
+    assert diagnostic["elapsed_seconds"] == pytest.approx(epoch_seconds)
+    assert diagnostic["checkpoint_preserved_for_resume"] is True
+
+
+@pytest.mark.parametrize(
+    "corruption", ["dense_weight", "exp_avg", "exp_avg_sq"]
+)
+def test_persistence_finite_audit_rejects_before_replacing_last_checkpoint(
+    tmp_path, monkeypatch, corruption
+):
+    prepared, _ = _prepared_tiny_run(monkeypatch)
+    monkeypatch.setattr(executor_module, "require_production_model", lambda _model: None)
+    binding = _binding(tmp_path, prepared.checkpoint_config_document())
+    checkpoint_path = tmp_path / "last.ckpt"
+    previous = b"previous-valid-checkpoint-must-survive"
+    checkpoint_path.write_bytes(previous)
+
+    def fake_train(_model, _optimizer, provider, **_kwargs):
+        provider.cursor += TRAINING_SAMPLES_PER_EPOCH
+        provider.batch_sequence += TRAINING_STEPS_PER_EPOCH
+        return executor_module.EpochMetrics(
+            TRAINING_SAMPLES_PER_EPOCH, TRAINING_STEPS_PER_EPOCH, 0.25
+        )
+
+    def corrupt_then_validate(model, *_args, **_kwargs):
+        parameter = next(model.parameters())
+        if corruption == "dense_weight":
+            with torch.no_grad():
+                parameter.reshape(-1)[0] = float("nan")
+        else:
+            prepared.optimizer.state[parameter][corruption] = torch.full_like(
+                parameter, float("inf")
+            )
+        return executor_module.EpochMetrics(
+            VALIDATION_SAMPLES_PER_EPOCH, VALIDATION_BATCHES_PER_EPOCH, 0.30
+        )
+
+    saves = []
+
+    def forbidden_save(*args, **kwargs):
+        saves.append((args, kwargs))
+        pytest.fail("non-finite state must be rejected before checkpoint replacement")
+
+    monkeypatch.setattr(executor_module, "train_epoch", fake_train)
+    monkeypatch.setattr(executor_module, "validate_epoch", corrupt_then_validate)
+    monkeypatch.setattr(executor_module, "save_last_checkpoint", forbidden_save)
+    progress = []
+
+    with pytest.raises(executor_module.PersistenceFiniteStateError, match="non-finite"):
+        run_production(
+            prepared,
+            binding,
+            str(tmp_path),
+            progress_callback=progress.append,
+            epoch_wall_clock=lambda: 0.0,
+        )
+
+    assert saves == []
+    assert checkpoint_path.read_bytes() == previous
+    assert not any(event["event"] == "epoch-checkpoint" for event in progress)

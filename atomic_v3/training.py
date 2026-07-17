@@ -72,12 +72,13 @@ def batch_loss(
     *,
     lambda_: float = 0.5,
     validate: bool = True,
+    check_finite: bool = True,
 ) -> torch.Tensor:
     if validate:
         validate_batch(batch)
     prediction = model(batch, validate=False)
     loss = atomic_loss(prediction, batch.outcome, batch.score, lambda_=lambda_)
-    if not torch.isfinite(loss):
+    if check_finite and not torch.isfinite(loss):
         raise FloatingPointError("Atomic V3 loss is not finite")
     return loss
 

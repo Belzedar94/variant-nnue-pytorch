@@ -541,6 +541,104 @@ class AtomicV3Batch:
         return int(self.side_to_move_white.shape[0])
 
 
+def _require_batch_tensor(name: str, value: object) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise DatasetContractError(f"{name} must be a torch.Tensor")
+    return value
+
+
+def _validate_sparse_slice_layout(
+    name: str,
+    value: object,
+    *,
+    batch_size: int,
+    max_active: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(value, SparseSliceBatch):
+        raise DatasetContractError(f"{name} must be SparseSliceBatch")
+    indices = _require_batch_tensor(f"{name}.indices", value.indices)
+    values = _require_batch_tensor(f"{name}.values", value.values)
+    if indices.ndim != 2 or indices.shape[0] != batch_size or values.shape != indices.shape:
+        raise DatasetContractError(
+            f"{name} indices/values must have equal [batch, width] shape"
+        )
+    if indices.shape[1] < 1 or indices.shape[1] > max_active:
+        raise DatasetContractError(f"{name} width exceeds frozen active bound")
+    if indices.dtype != torch.int32 or values.dtype != torch.float32:
+        raise DatasetContractError(f"{name} requires int32 indices and float32 values")
+    return indices, values
+
+
+def validate_batch_layout(batch: AtomicV3Batch) -> AtomicV3Batch:
+    """Validate the complete tensor ABI using metadata only.
+
+    This performs no tensor reduction, scalar transfer, or value read, so it is
+    safe as the full 16,384-row provider-canary boundary before the bounded
+    semantic reconstruction.
+    """
+
+    if not isinstance(batch, AtomicV3Batch):
+        raise DatasetContractError("AtomicNNUEV3 requires an AtomicV3Batch")
+    tensors: list[tuple[str, torch.Tensor]] = []
+
+    def owned(name: str, value: object) -> torch.Tensor:
+        tensor = _require_batch_tensor(name, value)
+        tensors.append((name, tensor))
+        return tensor
+
+    stm = owned("side_to_move_white", batch.side_to_move_white)
+    if stm.ndim != 2 or stm.shape[1] != 1 or stm.dtype != torch.float32:
+        raise DatasetContractError("side_to_move_white must be float32 [batch, 1]")
+    batch_size = int(stm.shape[0])
+    if batch_size == 0:
+        raise DatasetContractError("AtomicNNUEV3 batch must contain at least one sample")
+
+    piece_counts = owned("piece_counts", batch.piece_counts)
+    if piece_counts.shape != (batch_size,) or piece_counts.dtype != torch.long:
+        raise DatasetContractError("piece_counts must be torch.long [batch]")
+    bucket_indices = owned("bucket_indices", batch.bucket_indices)
+    if bucket_indices.shape != (batch_size,) or bucket_indices.dtype != torch.long:
+        raise DatasetContractError("bucket_indices must be torch.long [batch]")
+    outcome = owned("outcome", batch.outcome)
+    score = owned("score", batch.score)
+    if outcome.shape != (batch_size, 1) or score.shape != (batch_size, 1):
+        raise DatasetContractError("outcome and score must have shape [batch, 1]")
+    if outcome.dtype != torch.float32 or score.dtype != torch.float32:
+        raise DatasetContractError("outcome and score must use float32")
+
+    slices = (
+        ("hm", 0, HM_MAX_ACTIVE),
+        ("capture_pair", 1, CAPTURE_PAIR_MAX_ACTIVE),
+        ("king_blast_ep", 2, KING_BLAST_EP_MAX_ACTIVE),
+        ("blast_ring", 3, BLAST_RING_MAX_ACTIVE),
+    )
+    for perspective, perspective_batch in (
+        (Perspective.WHITE, batch.white),
+        (Perspective.BLACK, batch.black),
+    ):
+        if not isinstance(perspective_batch, PerspectiveBatch):
+            raise DatasetContractError("perspective payload must be PerspectiveBatch")
+        prefix = perspective.name
+        kings = owned(f"{prefix}.own_king_squares", perspective_batch.own_king_squares)
+        if kings.shape != (batch_size,) or kings.dtype != torch.long:
+            raise DatasetContractError("own_king_squares must be torch.long [batch]")
+        for field, _, max_active in slices:
+            indices, values = _validate_sparse_slice_layout(
+                f"{prefix}.{field}",
+                getattr(perspective_batch, field),
+                batch_size=batch_size,
+                max_active=max_active,
+            )
+            tensors.extend(
+                ((f"{prefix}.{field}.indices", indices), (f"{prefix}.{field}.values", values))
+            )
+
+    devices = {tensor.device for _, tensor in tensors}
+    if len(devices) != 1:
+        raise DatasetContractError("AtomicNNUEV3 batch tensors must share one device")
+    return batch
+
+
 def _validate_sparse_slice(
     name: str,
     value: SparseSliceBatch,
@@ -551,17 +649,7 @@ def _validate_sparse_slice(
     require_active: bool,
     sorted_unique: bool,
 ) -> None:
-    if not isinstance(value, SparseSliceBatch):
-        raise DatasetContractError(f"{name} must be SparseSliceBatch")
     indices, values = value.indices, value.values
-    if indices.ndim != 2 or indices.shape[0] != batch_size or values.shape != indices.shape:
-        raise DatasetContractError(f"{name} indices/values must have equal [batch, width] shape")
-    if indices.shape[1] < 1 or indices.shape[1] > max_active:
-        raise DatasetContractError(f"{name} width exceeds frozen active bound")
-    if indices.dtype != torch.int32 or values.dtype != torch.float32:
-        raise DatasetContractError(f"{name} requires int32 indices and float32 values")
-    if indices.device != values.device:
-        raise DatasetContractError(f"{name} indices and values use different devices")
     if not torch.all(torch.isfinite(values)):
         raise DatasetContractError(f"{name} values are not finite")
     for row_index in range(batch_size):
@@ -646,22 +734,11 @@ def _decode_hm_board(
 
 
 def validate_batch(batch: AtomicV3Batch) -> AtomicV3Batch:
-    if not isinstance(batch, AtomicV3Batch):
-        raise DatasetContractError("AtomicNNUEV3 requires an AtomicV3Batch")
+    validate_batch_layout(batch)
     stm = batch.side_to_move_white
-    if stm.ndim != 2 or stm.shape[1] != 1 or stm.dtype != torch.float32:
-        raise DatasetContractError("side_to_move_white must be float32 [batch, 1]")
     batch_size = int(stm.shape[0])
-    if batch_size == 0 or not torch.all((stm == 0.0) | (stm == 1.0)):
+    if not torch.all((stm == 0.0) | (stm == 1.0)):
         raise DatasetContractError("side_to_move_white must contain exact zero/one values")
-    if batch.piece_counts.shape != (batch_size,) or batch.piece_counts.dtype != torch.long:
-        raise DatasetContractError("piece_counts must be torch.long [batch]")
-    if batch.bucket_indices.shape != (batch_size,) or batch.bucket_indices.dtype != torch.long:
-        raise DatasetContractError("bucket_indices must be torch.long [batch]")
-    if batch.outcome.shape != (batch_size, 1) or batch.score.shape != (batch_size, 1):
-        raise DatasetContractError("outcome and score must have shape [batch, 1]")
-    if batch.outcome.dtype != torch.float32 or batch.score.dtype != torch.float32:
-        raise DatasetContractError("outcome and score must use float32")
     if not torch.all(torch.isfinite(batch.outcome)) or not torch.all(torch.isfinite(batch.score)):
         raise DatasetContractError("labels must be finite")
     if not torch.all(
@@ -690,11 +767,7 @@ def validate_batch(batch: AtomicV3Batch) -> AtomicV3Batch:
         (Perspective.WHITE, batch.white),
         (Perspective.BLACK, batch.black),
     ):
-        if not isinstance(perspective_batch, PerspectiveBatch):
-            raise DatasetContractError("perspective payload must be PerspectiveBatch")
         kings = perspective_batch.own_king_squares
-        if kings.shape != (batch_size,) or kings.dtype != torch.long:
-            raise DatasetContractError("own_king_squares must be torch.long [batch]")
         _validate_sparse_slice(
             f"{perspective.name}.hm",
             perspective_batch.hm,

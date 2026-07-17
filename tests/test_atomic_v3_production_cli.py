@@ -16,6 +16,12 @@ from atomic_v3.bootstrap_dataset import (
 from atomic_v3.checkpoint import TrainingCounters
 from atomic_v3.dataset import RoleManifest
 from atomic_v3.executor import SharedInitialState
+from atomic_v3.performance_gate import (
+    CumulativePerformanceGate,
+    PerformanceGatePolicy,
+    PerformanceGateRejected,
+    StepMeasurement,
+)
 from atomic_v3.serialization import WireMetadata
 from ranger import Ranger
 import train_atomic_v3
@@ -371,6 +377,85 @@ def test_failed_run_closes_provider_and_writes_machine_status(tmp_path, monkeypa
     assert status["error_type"] == "RuntimeError"
 
 
+def test_failed_status_retains_rejected_cumulative_gate_decision(
+    tmp_path, monkeypatch
+):
+    snapshot = _snapshot(tmp_path)
+    provider_library = tmp_path / "provider.dll"
+    provider_library.write_bytes(b"provider")
+    shared = _shared()
+    provider = _CloseProbe()
+
+    class Prepared:
+        model = object()
+        training_provider = provider
+        optimizer = object()
+        scheduler = object()
+        validation_provider_factory = object()
+
+        def checkpoint_config_document(self):
+            return {"normative": True}
+
+    gate = CumulativePerformanceGate(
+        PerformanceGatePolicy(
+            epoch_samples=1_000,
+            warmup_steps=0,
+            minimum_measured_steps=1,
+            rolling_window_steps=1,
+            target_total_epoch_seconds=300.0,
+            hard_max_total_epoch_seconds=600.0,
+            non_training_reserve_seconds=0.0,
+        ),
+        minimum_measured_samples=1,
+    )
+    decision = gate.observe(StepMeasurement(samples=1, elapsed_seconds=1.0))
+    assert decision.rejected
+
+    def reject(*_args, progress_callback, **_kwargs):
+        progress_callback(
+            {
+                "event": "heartbeat",
+                "phase": "training",
+                "global_steps": 32,
+                "total_steps": 100,
+                "cumulative_performance_gate": decision.to_document(),
+            }
+        )
+        raise PerformanceGateRejected(decision)
+
+    monkeypatch.setattr(production, "prepare_production_run", lambda *a, **k: Prepared())
+    monkeypatch.setattr(production, "run_production", reject)
+    output = tmp_path / "output"
+    policy = PerformanceGatePolicy(epoch_samples=1_000)
+    with pytest.raises(PerformanceGateRejected):
+        production.execute_one_run(
+            run_id="lambda-0",
+            snapshot=snapshot,
+            output_root=output,
+            provider_library=provider_library,
+            provider_sha256=production.sha256_file(provider_library),
+            trainer_commit=TRAINER_COMMIT,
+            shared=shared,
+            shared_artifact={
+                "path": str(tmp_path / "shared.pt"),
+                "bytes": 1,
+                "file_sha256": SHA_A,
+                "state_sha256": shared.sha256,
+            },
+            device="cuda:0",
+            resume=False,
+            performance_policy=policy,
+        )
+
+    status = json.loads((output / "runs" / "lambda-0" / "status.json").read_text())
+    assert status["status"] == "failed"
+    assert status["error_type"] == "PerformanceGateRejected"
+    rejected = status["last_progress"]["cumulative_performance_gate"]
+    assert rejected["status"] == "rejected"
+    assert rejected["reason"]
+    assert rejected["metrics"]["samples"] == 1
+
+
 def test_existing_checkpoint_without_resume_fails_before_prepare_and_preserves_bytes(
     tmp_path, monkeypatch
 ):
@@ -511,7 +596,7 @@ def test_progress_reporter_persists_atomic_eta_and_checkpoint_payload(tmp_path):
     assert status["updated_at_utc"].endswith("Z")
 
 
-def test_provider_factory_passes_the_receipted_sha_to_native_binding(
+def test_provider_factory_passes_receipted_sha_and_role_specific_skip(
     tmp_path, monkeypatch
 ):
     snapshot = _snapshot(tmp_path)
@@ -534,6 +619,17 @@ def test_provider_factory_passes_the_receipted_sha_to_native_binding(
     assert factory() is sentinel
     assert calls[0]["library_path"] == provider_library
     assert calls[0]["library_sha256"] == SHA_A
+    assert calls[0]["random_fen_skipping"] == 3
+
+    validation = production._provider_factory(
+        snapshot,
+        "validation",
+        provider_library=provider_library,
+        provider_sha256=SHA_A,
+        device="cuda:0",
+    )
+    assert validation() is sentinel
+    assert calls[1]["random_fen_skipping"] == 0
 
 
 def test_execute_all_runs_reuses_one_shared_state_and_updates_summary(
@@ -556,10 +652,23 @@ def test_execute_all_runs_reuses_one_shared_state_and_updates_summary(
         "load_or_create_shared_initial_state",
         lambda path: (shared, shared_artifact),
     )
-    calls = []
+    events = []
+    preflight = {
+        "status": "target",
+        "gate_passed": True,
+        "benchmark": {
+            "gate": {"metrics": {"cold_authentication_seconds": 12.5}}
+        },
+    }
+
+    def gate(**kwargs):
+        events.append(("preflight", kwargs))
+        return preflight
+
+    monkeypatch.setattr(production, "_run_mandatory_preflight", gate)
 
     def one(**kwargs):
-        calls.append(kwargs)
+        events.append(("campaign", kwargs))
         return {"format": production.FINAL_RECEIPT_FORMAT, "run_id": kwargs["run_id"]}
 
     monkeypatch.setattr(production, "execute_one_run", one)
@@ -574,10 +683,187 @@ def test_execute_all_runs_reuses_one_shared_state_and_updates_summary(
         run_ids=selected,
         device="cuda",
     )
+    assert events[0][0] == "preflight"
+    assert events[0][1]["snapshot"] is snapshot
+    calls = [payload for name, payload in events if name == "campaign"]
     assert [call["run_id"] for call in calls] == list(selected)
     assert all(call["shared"] is shared for call in calls)
+    assert all(call["performance_policy"].elapsed_exclusion_seconds == 12.5 for call in calls)
     assert summary["status"] == "completed"
+    assert summary["preflight"] == preflight
     assert json.loads((output / "training-summary.json").read_text()) == summary
+
+
+def test_rejected_mandatory_preflight_prevents_campaign_artifacts(
+    tmp_path, monkeypatch
+):
+    snapshot = _snapshot(tmp_path)
+    provider_library = tmp_path / "provider.dll"
+    provider_library.write_bytes(b"provider")
+    shared = _shared()
+    shared_artifact = {
+        "path": str(tmp_path / "shared.pt"),
+        "state_sha256": shared.sha256,
+    }
+    monkeypatch.setattr(production, "_validate_cuda_device", lambda _value: "cuda:0")
+    monkeypatch.setattr(production, "inspect_bootstrap_roles", lambda *_args: snapshot)
+    monkeypatch.setattr(
+        production,
+        "load_or_create_shared_initial_state",
+        lambda _path: (shared, shared_artifact),
+    )
+    rejected = {
+        "status": "rejected",
+        "gate_passed": False,
+        "epochs_started": 0,
+        "checkpoints_written": 0,
+    }
+    monkeypatch.setattr(
+        production, "_run_mandatory_preflight", lambda **_kwargs: rejected
+    )
+    monkeypatch.setattr(
+        production,
+        "execute_one_run",
+        lambda **_kwargs: pytest.fail("campaign must not start after rejection"),
+    )
+    output = tmp_path / "output"
+
+    with pytest.raises(production.ProductionPreflightRejected) as raised:
+        production.execute_runs(
+            receipt_path=snapshot.receipt_path,
+            receipt_sha256=snapshot.receipt_sha256,
+            provider_library=provider_library,
+            output_root=output,
+            trainer_commit=TRAINER_COMMIT,
+            run_ids=("lambda-0",),
+        )
+
+    assert raised.value.document == rejected
+    assert not (output / "training-summary.json").exists()
+    assert not (output / "runs").exists()
+    assert not (output / "artifacts").exists()
+
+
+def test_preflight_only_starts_zero_epochs_and_writes_no_campaign_artifacts(
+    tmp_path, monkeypatch
+):
+    snapshot = _snapshot(tmp_path)
+    provider_library = tmp_path / "provider.dll"
+    provider_library.write_bytes(b"provider")
+    shared = _shared()
+    monkeypatch.setattr(production, "_validate_cuda_device", lambda _value: "cuda:0")
+    monkeypatch.setattr(production, "inspect_bootstrap_roles", lambda *_args: snapshot)
+    monkeypatch.setattr(
+        production,
+        "load_or_create_shared_initial_state",
+        lambda _path: (
+            shared,
+            {"path": str(tmp_path / "shared.pt"), "state_sha256": shared.sha256},
+        ),
+    )
+    preflight = {
+        "status": "target",
+        "gate_passed": True,
+        "ephemeral_optimizer_steps": 15,
+        "epochs_started": 0,
+        "checkpoints_written": 0,
+    }
+    monkeypatch.setattr(
+        production, "_run_mandatory_preflight", lambda **_kwargs: preflight
+    )
+    monkeypatch.setattr(
+        production,
+        "execute_one_run",
+        lambda **_kwargs: pytest.fail("preflight-only must not enter campaign"),
+    )
+    output = tmp_path / "output"
+
+    report = production.execute_runs(
+        receipt_path=snapshot.receipt_path,
+        receipt_sha256=snapshot.receipt_sha256,
+        provider_library=provider_library,
+        output_root=output,
+        trainer_commit=TRAINER_COMMIT,
+        run_ids=("lambda-0",),
+        preflight_only=True,
+    )
+
+    assert report["mode"] == "mandatory-preflight-only"
+    assert report["training_campaign_started"] is False
+    assert report["epochs_started"] == 0
+    assert report["checkpoints_written"] == 0
+    assert report["preflight"] == preflight
+    assert not (output / "training-summary.json").exists()
+    assert not (output / "runs").exists()
+
+
+def test_production_parser_has_preflight_only_and_no_unsafe_bypass():
+    parser = train_atomic_v3.build_parser()
+    option_strings = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
+    assert "--preflight-only" in option_strings
+    assert "--skip-preflight" not in option_strings
+    assert "--no-preflight" not in option_strings
+
+
+def test_mandatory_preflight_is_fixed_5_plus_10_and_returns_after_cleanup(
+    tmp_path, monkeypatch
+):
+    from scripts import benchmark_atomic_v3_repair as benchmark_module
+
+    snapshot = _snapshot(tmp_path)
+    provider = tmp_path / "provider.dll"
+    provider.write_bytes(b"provider")
+    shared_path = tmp_path / "shared.pt"
+    shared_path.write_bytes(b"shared")
+    provider_sha = production.sha256_file(provider)
+    events = []
+
+    def run(arguments):
+        events.append("ephemeral-state-cleaned-before-return")
+        assert arguments.warmup_steps == 5
+        assert arguments.measured_steps == 10
+        assert arguments.bootstrap_source == [
+            str(snapshot.receipt_path),
+            snapshot.receipt_sha256,
+        ]
+        return (
+            {
+                "status": "target",
+                "gate_passed": True,
+                "ephemeral_optimizer_steps": 15,
+                "epochs_started": 0,
+                "checkpoints_written": 0,
+                "identity": {
+                    "receipt_sha256": snapshot.receipt_sha256,
+                    "provider_library_sha256": provider_sha,
+                    "shared_initial_state_state_sha256": SHA_B,
+                    "device": "cuda:0",
+                    "run_id": "lambda-0",
+                },
+            },
+            SimpleNamespace(
+                decision=SimpleNamespace(status=SimpleNamespace(value="target"))
+            ),
+        )
+
+    monkeypatch.setattr(benchmark_module, "run_benchmark_command", run)
+    result = production._run_mandatory_preflight(
+        snapshot=snapshot,
+        provider_library=provider,
+        provider_sha256=provider_sha,
+        shared_artifact={"path": str(shared_path), "state_sha256": SHA_B},
+        device="cuda:0",
+        run_id="lambda-0",
+    )
+
+    assert events == ["ephemeral-state-cleaned-before-return"]
+    assert result["same_process"] is True
+    assert result["ephemeral_state_discarded"] is True
+    assert result["training_campaign_started"] is False
 
 
 def test_cli_routes_non_dry_execution_to_normative_orchestrator(
@@ -617,8 +903,51 @@ def test_cli_routes_non_dry_execution_to_normative_orchestrator(
     assert calls[0]["run_ids"] == tuple(executor_module.RUN_CONFIGS)
     assert calls[0]["resume"] is True
     assert calls[0]["device"] == "cuda:0"
+    assert calls[0]["preflight_only"] is False
     captured = capfd.readouterr()
     assert json.loads(captured.out) == {"status": "completed", "results": []}
+    assert captured.err == ""
+
+
+def test_cli_preflight_only_emits_machine_report_and_routes_no_bypass(
+    tmp_path, monkeypatch, capfd
+):
+    provider = tmp_path / "provider.dll"
+    provider.write_bytes(b"provider")
+    calls = []
+    expected = {
+        "status": "target",
+        "mode": "mandatory-preflight-only",
+        "training_campaign_started": False,
+        "epochs_started": 0,
+        "checkpoints_written": 0,
+    }
+
+    def execute(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(train_atomic_v3, "execute_runs", execute)
+    assert train_atomic_v3.main(
+        [
+            "--run",
+            "lambda-0",
+            "--bootstrap-source",
+            "receipt.json",
+            SHA_A,
+            "--provider-library",
+            str(provider),
+            "--output-root",
+            str(tmp_path / "output"),
+            "--trainer-commit",
+            TRAINER_COMMIT,
+            "--preflight-only",
+        ]
+    ) == 0
+
+    assert calls[0]["preflight_only"] is True
+    captured = capfd.readouterr()
+    assert json.loads(captured.out) == expected
     assert captured.err == ""
 
 

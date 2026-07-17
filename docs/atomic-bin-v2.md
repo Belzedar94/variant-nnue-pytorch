@@ -7,7 +7,7 @@ record decoding, Atomic legality and byte-exact canonical validation to the
 pinned Atomic-Stockfish reader.
 
 The engine submodule is fixed to
-`420c9f35266fbdc2167dc5b9d8d20d90281c60c9`. Configuration fails if the
+`34a1e71ceb201e4074545998b3b32a7e016fac0f`. Configuration fails if the
 gitlink, checkout, origin URL, schema hashes or `origin/main` ancestry differ,
 or if the submodule is dirty. In addition to the data and manifest schemas,
 the cross-repository handoff authenticates the public lossless decoder schema

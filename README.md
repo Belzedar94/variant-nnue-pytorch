@@ -108,7 +108,7 @@ must not be used for real training or model comparison.
 The same seed controls model initialization and native random skipping. Native
 batch order is stable across worker counts. Legacy training retains its
 zero-skip validation behavior. The isolated AtomicNNUEV3 bootstrap instead
-freezes skip 3 for both roles and resets validation to the same accepted prefix
+freezes skip 3 for training, skip 0 for validation, and resets validation to the same prefix
 of its dedicated chunk on every pass.
 
 For Legacy `.bin` input, smart FEN skipping retains the trainer's historical
