@@ -1,3 +1,4 @@
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,11 @@ import torch
 import atomic_v3.training as v3_training
 from atomic_v3.dataset import SparseSliceBatch, load_canonical_fixture
 from atomic_v3.dense import AtomicV3LayerStacks, fake_quantize_integer_bias
+from atomic_v3.executor import (
+    PersistenceFiniteStateError,
+    audit_persistence_finite_state,
+    create_production_optimizer,
+)
 from atomic_v3.model import (
     AtomicNNUEV3,
     AtomicV3FeatureTransformer,
@@ -33,6 +39,7 @@ from atomic_v3.quantization import (
     fake_quantize_psqt_output,
     fake_quantize_psqt_weight,
 )
+from atomic_v3.serialization import _quantized_numpy
 from atomic_v3.training import (
     atomic_loss,
     create_core_optimizer,
@@ -184,7 +191,7 @@ def test_v3_composed_transformer_factorizes_hm_and_gives_relations_no_psqt():
     assert transformer.hm_bucket_weight.shape[1] == 1032
 
 
-def test_factorized_and_relation_tables_keep_sparse_active_row_gradients():
+def test_factorized_and_relation_tables_produce_dense_gradients():
     transformer = _tiny_transformer()
     perspective = SimpleNamespace(
         hm=_slice(), capture_pair=_slice(), king_blast_ep=_slice(), blast_ring=_slice()
@@ -200,8 +207,10 @@ def test_factorized_and_relation_tables_keep_sparse_active_row_gradients():
         transformer.blast_ring_weight,
     ):
         assert parameter.grad is not None
-        assert parameter.grad.is_sparse
-        assert parameter.grad.coalesce().indices().shape[1] == 1
+        assert parameter.grad.is_sparse is False
+        assert parameter.grad.shape == parameter.shape
+        assert torch.all(torch.isfinite(parameter.grad))
+        assert torch.count_nonzero(parameter.grad) > 0
 
 
 def test_mixed_feature_quantizers_use_i8_only_for_cp_and_ring():
@@ -298,6 +307,62 @@ def test_clip_weights_makes_mixed_tables_and_factor_sums_exportable():
             integers = torch.round(bias.to(dtype) * scale).to(torch.float64)
             assert torch.all(integers >= -(1 << 31))
             assert torch.all(integers <= (1 << 31) - 1)
+
+
+def test_training_clip_avoids_reductions_and_keeps_all_coalesced_ranges(monkeypatch):
+    model = _tiny_model()
+    transformer = model.feature_transformer
+    with torch.no_grad():
+        for parameter in transformer.parameters():
+            parameter.fill_(1.0e9)
+        for parameter in model.network.parameters():
+            parameter.fill_(-1.0e9)
+
+    def forbidden_reduction(*_args, **_kwargs):
+        raise AssertionError("per-step clipping must not synchronize through torch.all")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "all", forbidden_reduction)
+        model.clip_training_weights()
+
+    hm = transformer.hm_bucket_weight + transformer.hm_virtual_weight
+    assert torch.all(hm[:, :1024] >= -32768.0 / FT_ONE)
+    assert torch.all(hm[:, :1024] <= 32767.0 / FT_ONE)
+    assert torch.all(hm[:, 1024:] >= PSQT_EXPORT_MIN)
+    assert torch.all(hm[:, 1024:] <= PSQT_EXPORT_MAX)
+    fc0_weight = (
+        model.network.fc0.linear.weight
+        + model.network.fc0.factorized_linear.weight.repeat(8, 1)
+    )
+    fc0_limit = 127.0 / FC0_WEIGHT_SCALE
+    assert torch.all(fc0_weight >= -fc0_limit)
+    assert torch.all(fc0_weight <= fc0_limit)
+    fc0_bias = (
+        model.network.fc0.linear.bias
+        + model.network.fc0.factorized_linear.bias.repeat(8)
+    )
+    assert torch.all(fc0_bias >= FC0_BIAS_EXPORT_MIN)
+    assert torch.all(fc0_bias <= FC0_BIAS_EXPORT_MAX)
+
+    # The strict boundary remains responsible for exact signed-i32 safety.
+    model.clip_weights()
+    _assert_hm_psqt_serializable_in_both_widths(transformer)
+    _assert_fc0_serializable_in_both_widths(model)
+
+
+def test_training_and_exact_clips_match_for_interior_parameters():
+    fast = _tiny_model()
+    generator = torch.Generator().manual_seed(0xA70C0004)
+    with torch.no_grad():
+        for parameter in fast.parameters():
+            parameter.uniform_(-0.05, 0.05, generator=generator)
+    exact = copy.deepcopy(fast)
+
+    fast.clip_training_weights()
+    exact.clip_weights()
+
+    for fast_parameter, exact_parameter in zip(fast.parameters(), exact.parameters()):
+        torch.testing.assert_close(fast_parameter, exact_parameter, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("scale", [FC0_BIAS_SCALE, FC1_BIAS_SCALE, FC2_BIAS_SCALE])
@@ -455,12 +520,102 @@ def test_clip_weights_rejects_nonfinite_dense_biases(nonfinite):
         model.clip_weights()
 
 
+@pytest.mark.parametrize(
+    "parameter_path",
+    [
+        "feature_transformer.capture_pair_weight",
+        "network.fc0.linear.weight",
+    ],
+)
+def test_persistence_audit_rejects_nan_relation_and_dense_weights(parameter_path):
+    model = _tiny_model()
+    optimizer = create_core_optimizer(model)
+    target = model
+    for component in parameter_path.split("."):
+        target = getattr(target, component)
+    with torch.no_grad():
+        target.reshape(-1)[0] = float("nan")
+
+    with pytest.raises(PersistenceFiniteStateError, match="non-finite"):
+        audit_persistence_finite_state(model, optimizer)
+
+
+@pytest.mark.parametrize("state_name", ["exp_avg", "exp_avg_sq"])
+def test_persistence_audit_rejects_infinite_ranger_moments(state_name):
+    model = _tiny_model()
+    optimizer, _scheduler = create_production_optimizer(model)
+    parameter = next(model.parameters())
+    optimizer.state[parameter][state_name] = torch.full_like(parameter, float("inf"))
+
+    with pytest.raises(PersistenceFiniteStateError, match="optimizer state"):
+        audit_persistence_finite_state(model, optimizer)
+
+
+def test_persistence_audit_reduces_to_one_host_check_on_single_device(monkeypatch):
+    model = _tiny_model()
+    optimizer, _scheduler = create_production_optimizer(model)
+    parameter = next(model.parameters())
+    optimizer.state[parameter]["nested"] = {
+        "exp_avg": torch.zeros_like(parameter),
+        "exp_avg_sq": torch.ones_like(parameter),
+    }
+    calls = []
+    original = torch.Tensor.item
+
+    def item(tensor, *args, **kwargs):
+        calls.append(tensor.device)
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "item", item)
+    report = audit_persistence_finite_state(model, optimizer)
+
+    assert report["device_synchronizations"] == 1
+    assert calls == [torch.device("cpu")]
+
+
 def test_psqt_fake_quantizer_stays_inside_i32_after_adversarial_float32_input():
     values = torch.tensor([[-1.0e30, 1.0e30]], dtype=torch.float32)
     quantized = fake_quantize_psqt_weight(values)
     integers = torch.round(quantized.to(torch.float64) * PSQT_WEIGHT_SCALE)
     assert torch.all(integers >= -(1 << 31))
     assert torch.all(integers <= (1 << 31) - 1)
+
+
+def test_model_psqt_qat_matches_serializer_at_half_steps_and_i32_boundaries():
+    transformer = _tiny_transformer()
+    half_steps = torch.tensor(
+        [
+            (16_292.0 + 0.5) / PSQT_WEIGHT_SCALE,
+            (-499_998.0 + 0.5) / PSQT_WEIGHT_SCALE,
+            (0.0 + 0.5) / PSQT_WEIGHT_SCALE,
+            (-1.0 + 0.5) / PSQT_WEIGHT_SCALE,
+        ],
+        dtype=torch.float32,
+    )
+    lower = torch.tensor(PSQT_EXPORT_MIN, dtype=torch.float32)
+    upper = torch.tensor(PSQT_EXPORT_MAX, dtype=torch.float32)
+    values = torch.cat(
+        (
+            half_steps,
+            torch.stack(
+                (
+                    lower,
+                    torch.nextafter(lower, torch.tensor(float("inf"))),
+                    torch.nextafter(upper, torch.tensor(float("-inf"))),
+                    upper,
+                )
+            ),
+        )
+    )
+    with torch.no_grad():
+        transformer.hm_bucket_weight[0, 1024:] = values
+        transformer.hm_virtual_weight.zero_()
+
+    prepared, *_ = transformer._prepared_weights(fake_quantize_weights=True)
+    actual = prepared[0, 1024:]
+    wire = _quantized_numpy(values, PSQT_WEIGHT_SCALE, "<i4", "PSQT parity")
+    expected = torch.from_numpy(wire).to(torch.float64).div(PSQT_WEIGHT_SCALE).to(torch.float32)
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_optimizer_step_clips_both_the_forward_boundary_and_persistent_state(monkeypatch):
@@ -601,10 +756,8 @@ def test_atomic_v3_cuda_clamp_forward_backward_and_optimizer_edges(monkeypatch):
     _assert_hm_psqt_serializable_in_both_widths(model.feature_transformer)
     _assert_fc0_serializable_in_both_widths(model)
     assert model.feature_transformer.hm_bucket_weight.grad is not None
-    assert model.feature_transformer.hm_bucket_weight.grad.is_sparse
-    assert torch.all(
-        torch.isfinite(model.feature_transformer.hm_bucket_weight.grad.coalesce().values())
-    )
+    assert model.feature_transformer.hm_bucket_weight.grad.is_sparse is False
+    assert torch.all(torch.isfinite(model.feature_transformer.hm_bucket_weight.grad))
     del optimizer, batch, model
     torch.cuda.empty_cache()
 
@@ -629,6 +782,30 @@ def test_sfnnv15_dense_tail_shapes_and_short_skip_are_frozen():
         fake_quantize_weights=False,
     )
     torch.testing.assert_close(output, torch.full((3, 1), 2.0))
+
+
+def test_sfnnv15_dense_tail_rejects_invalid_bucket_for_direct_callers():
+    stacks = AtomicV3LayerStacks()
+    with pytest.raises(ValueError, match="layer-stack index outside"):
+        stacks(
+            torch.zeros((1, 1024)),
+            torch.tensor([8]),
+            fake_quantize_activations=False,
+            fake_quantize_weights=False,
+        )
+
+
+def test_model_trusted_hot_path_does_not_execute_bucket_host_predicate(monkeypatch):
+    model = _tiny_model()
+    batch = _tiny_forward_batch("cpu")
+
+    def forbidden_any(*args, **kwargs):
+        raise AssertionError("trusted Atomic V3 hot path called torch.any")
+
+    monkeypatch.setattr(torch, "any", forbidden_any)
+    output = model(batch, validate=False)
+    assert output.shape == (1, 1)
+    assert torch.all(torch.isfinite(output))
 
 
 def test_signed_psqt_half_uses_cpp_truncation_and_keeps_ste_gradient():

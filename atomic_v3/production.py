@@ -8,10 +8,12 @@ alternate reader, optimizer, loss, or serializer path.
 
 from __future__ import annotations
 
+import argparse
 import gc
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -20,7 +22,11 @@ from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
-from .bootstrap_dataset import BootstrapReceiptSnapshot, inspect_bootstrap_roles
+from .bootstrap_dataset import (
+    BOOTSTRAP_RECORDS_PER_MANIFEST,
+    BootstrapReceiptSnapshot,
+    inspect_bootstrap_roles,
+)
 from .checkpoint import (
     CheckpointBinding,
     CommitBinding,
@@ -32,7 +38,9 @@ from .checkpoint import (
 from .executor import (
     EPOCHS,
     MICROBATCH_SIZE,
+    RANDOM_SKIP,
     RUN_CONFIGS,
+    TRAINING_SAMPLES_PER_EPOCH,
     PreparedProductionRun,
     ProductionRunConfig,
     SharedInitialState,
@@ -43,6 +51,7 @@ from .executor import (
     validate_production_counters,
 )
 from .native_provider import NativeAtomicV3Provider
+from .performance_gate import PerformanceGatePolicy
 from .serialization import WireMetadata, check_nnue, save_nnue
 
 
@@ -50,10 +59,26 @@ SHARED_INITIAL_STATE_FORMAT = "atomic-v3-shared-initial-state-v1"
 FINAL_RECEIPT_FORMAT = "atomic-v3-training-final-receipt-v1"
 SUMMARY_FORMAT = "atomic-v3-training-summary-v1"
 STATUS_FORMAT = "atomic-v3-training-status-v1"
+MANDATORY_PREFLIGHT_WARMUP_STEPS = 5
+MANDATORY_PREFLIGHT_MEASURED_STEPS = 10
+MANDATORY_TARGET_TOTAL_EPOCH_SECONDS = 300.0
+MANDATORY_HARD_MAX_TOTAL_EPOCH_SECONDS = 600.0
+MANDATORY_NON_TRAINING_RESERVE_SECONDS = 60.0
+CAMPAIGN_MINIMUM_MEASURED_SAMPLES = math.ceil(
+    BOOTSTRAP_RECORDS_PER_MANIFEST / (RANDOM_SKIP + 1)
+)
 
 
 class ProductionLaunchError(RuntimeError):
     """The production launcher could not satisfy an authenticated invariant."""
+
+
+class ProductionPreflightRejected(ProductionLaunchError):
+    """Mandatory same-process preflight rejected before campaign creation."""
+
+    def __init__(self, document: Mapping[str, object]) -> None:
+        self.document = dict(document)
+        super().__init__("mandatory production preflight rejected the campaign")
 
 
 def _canonical_json_bytes(document: Mapping[str, object]) -> bytes:
@@ -232,7 +257,7 @@ def _provider_factory(
             manifest_records=tuple(item.records for item in manifests),
             manifest_payloads=tuple(item.payload for item in manifests),
             batch_size=MICROBATCH_SIZE,
-            random_fen_skipping=3,
+            random_fen_skipping=3 if role == "train" else 0,
             seed=42,
             native_workers=1,
             device=device,
@@ -492,6 +517,7 @@ def execute_one_run(
     shared_artifact: Mapping[str, object],
     device: str,
     resume: bool,
+    performance_policy: Optional[PerformanceGatePolicy] = None,
 ) -> dict[str, object]:
     """Execute or verify one run and return its machine-readable receipt."""
 
@@ -593,12 +619,20 @@ def execute_one_run(
                 "updated_at_utc": _utc_text(_utc_now()),
             },
         )
+        run_keywords: dict[str, object] = {
+            "resume": resume_from_checkpoint,
+            "progress_callback": progress,
+        }
+        if performance_policy is not None:
+            run_keywords.update(
+                performance_policy=performance_policy,
+                performance_minimum_samples=CAMPAIGN_MINIMUM_MEASURED_SAMPLES,
+            )
         counters = run_production(
             prepared,
             binding,
             os.fspath(run_directory),
-            resume=resume_from_checkpoint,
-            progress_callback=progress,
+            **run_keywords,
         )
         if counters.completed_epochs != EPOCHS:
             raise ProductionLaunchError("production run ended before epoch 37")
@@ -701,6 +735,108 @@ def _validate_cuda_device(device: str) -> str:
     return f"cuda:{index}"
 
 
+def _run_mandatory_preflight(
+    *,
+    snapshot: BootstrapReceiptSnapshot,
+    provider_library: Path,
+    provider_sha256: str,
+    shared_artifact: Mapping[str, object],
+    device: str,
+    run_id: str,
+) -> dict[str, object]:
+    """Run the fixed 5+10 production-shaped gate and discard its state.
+
+    This is deliberately called from :func:`execute_runs`, in the same Python
+    process and after the exact receipt/provider/shared-init/device have been
+    authenticated.  The benchmark adapter owns cleanup in a ``finally`` block;
+    returning from here therefore proves that no mutated preflight model or
+    provider can become the campaign state.
+    """
+
+    from scripts.benchmark_atomic_v3_repair import run_benchmark_command
+
+    shared_path = shared_artifact.get("path")
+    if not isinstance(shared_path, str):
+        raise ProductionLaunchError("shared initial-state artifact has no path")
+    arguments = argparse.Namespace(
+        bootstrap_source=[
+            os.fspath(snapshot.receipt_path),
+            snapshot.receipt_sha256,
+        ],
+        provider_library=os.fspath(provider_library),
+        shared_initial_state=shared_path,
+        run=run_id,
+        device=device,
+        warmup_steps=MANDATORY_PREFLIGHT_WARMUP_STEPS,
+        measured_steps=MANDATORY_PREFLIGHT_MEASURED_STEPS,
+        target_epoch_seconds=MANDATORY_TARGET_TOTAL_EPOCH_SECONDS,
+        hard_max_epoch_seconds=MANDATORY_HARD_MAX_TOTAL_EPOCH_SECONDS,
+    )
+    document, report = run_benchmark_command(arguments)
+    identity = document.get("identity")
+    if not isinstance(identity, Mapping):
+        raise ProductionLaunchError("mandatory preflight omitted its identity")
+    expected_identity = {
+        "receipt_sha256": snapshot.receipt_sha256,
+        "provider_library_sha256": provider_sha256,
+        "shared_initial_state_state_sha256": shared_artifact.get("state_sha256"),
+        "device": device,
+        "run_id": run_id,
+    }
+    for field, expected in expected_identity.items():
+        if identity.get(field) != expected:
+            raise ProductionLaunchError(
+                f"mandatory preflight {field} differs from production binding"
+            )
+    if document.get("ephemeral_optimizer_steps") != (
+        MANDATORY_PREFLIGHT_WARMUP_STEPS + MANDATORY_PREFLIGHT_MEASURED_STEPS
+    ):
+        raise ProductionLaunchError("mandatory preflight did not execute exactly 5+10")
+    if document.get("epochs_started") != 0 or document.get("checkpoints_written") != 0:
+        raise ProductionLaunchError("mandatory preflight entered a training campaign")
+    result = dict(document)
+    result.update(
+        {
+            "mandatory": True,
+            "same_process": True,
+            "ephemeral_state_discarded": True,
+            "training_campaign_started": False,
+        }
+    )
+    # Keep the object alive only long enough to cross-check the serialized
+    # decision; no model/provider state is reachable through this report.
+    if report.decision.status.value != result.get("status"):
+        raise ProductionLaunchError("mandatory preflight decision report disagrees")
+    return result
+
+
+def _campaign_policy_from_preflight(
+    document: Mapping[str, object],
+) -> PerformanceGatePolicy:
+    try:
+        benchmark = document["benchmark"]
+        gate = benchmark["gate"]  # type: ignore[index]
+        metrics = gate["metrics"]  # type: ignore[index]
+        cold_authentication = float(metrics["cold_authentication_seconds"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ProductionLaunchError(
+            "mandatory preflight lacks campaign performance evidence"
+        ) from error
+    return PerformanceGatePolicy(
+        epoch_samples=TRAINING_SAMPLES_PER_EPOCH,
+        warmup_steps=0,
+        minimum_measured_steps=1,
+        rolling_window_steps=1,
+        target_total_epoch_seconds=MANDATORY_TARGET_TOTAL_EPOCH_SECONDS,
+        hard_max_total_epoch_seconds=MANDATORY_HARD_MAX_TOTAL_EPOCH_SECONDS,
+        non_training_reserve_seconds=MANDATORY_NON_TRAINING_RESERVE_SECONDS,
+        # Real campaign chunks contain later shard transitions.  Exclude only
+        # the first cold authentication so its one-off boundary cost is not
+        # extrapolated as if it occurred every heartbeat.
+        elapsed_exclusion_seconds=cold_authentication,
+    )
+
+
 def execute_runs(
     *,
     receipt_path: object,
@@ -712,8 +848,9 @@ def execute_runs(
     shared_initial_state: Optional[object] = None,
     device: str = "cuda",
     resume: bool = False,
+    preflight_only: bool = False,
 ) -> dict[str, object]:
-    """Execute the selected runs sequentially with one authenticated init."""
+    """Gate, then execute selected runs sequentially with fresh campaign state."""
 
     if not run_ids or any(run_id not in RUN_CONFIGS for run_id in run_ids):
         raise ProductionLaunchError("run selection differs from the four-run contract")
@@ -732,15 +869,39 @@ def execute_runs(
     provider_sha256 = sha256_file(provider_path)
     snapshot = inspect_bootstrap_roles(receipt_path, receipt_sha256)
     root = Path(os.path.abspath(os.fspath(output_root)))
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "runs").mkdir(exist_ok=True)
-    (root / "artifacts").mkdir(exist_ok=True)
     shared_path = (
         Path(os.path.abspath(os.fspath(shared_initial_state)))
         if shared_initial_state is not None
         else root / "shared-initial-state.pt"
     )
     shared, shared_artifact = load_or_create_shared_initial_state(shared_path)
+    preflight = _run_mandatory_preflight(
+        snapshot=snapshot,
+        provider_library=provider_path,
+        provider_sha256=provider_sha256,
+        shared_artifact=shared_artifact,
+        device=resolved_device,
+        run_id=run_ids[0],
+    )
+    if preflight_only:
+        return {
+            "format": SUMMARY_FORMAT,
+            "status": preflight["status"],
+            "mode": "mandatory-preflight-only",
+            "gate_passed": bool(preflight.get("gate_passed")),
+            "training_campaign_started": False,
+            "epochs_started": 0,
+            "checkpoints_written": 0,
+            "preflight": preflight,
+        }
+    if not preflight.get("gate_passed"):
+        raise ProductionPreflightRejected(preflight)
+    campaign_policy = _campaign_policy_from_preflight(preflight)
+    # Campaign directories and status do not exist until the mandatory gate
+    # has accepted and its mutated model/provider have been cleaned up.
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "runs").mkdir(exist_ok=True)
+    (root / "artifacts").mkdir(exist_ok=True)
     summary_path = root / "training-summary.json"
     summary: dict[str, object] = {
         "format": SUMMARY_FORMAT,
@@ -753,6 +914,7 @@ def execute_runs(
         "device": resolved_device,
         "resume": bool(resume),
         "selected_runs": list(run_ids),
+        "preflight": preflight,
         "results": [],
     }
     _atomic_replace_bytes(summary_path, _canonical_json_bytes(summary))
@@ -769,6 +931,7 @@ def execute_runs(
                 shared_artifact=shared_artifact,
                 device=resolved_device,
                 resume=resume,
+                performance_policy=campaign_policy,
             )
             summary["results"].append(result)
             _atomic_replace_bytes(summary_path, _canonical_json_bytes(summary))
@@ -784,8 +947,10 @@ def execute_runs(
 
 
 __all__ = [
+    "CAMPAIGN_MINIMUM_MEASURED_SAMPLES",
     "FINAL_RECEIPT_FORMAT",
     "ProductionLaunchError",
+    "ProductionPreflightRejected",
     "SHARED_INITIAL_STATE_FORMAT",
     "STATUS_FORMAT",
     "SUMMARY_FORMAT",

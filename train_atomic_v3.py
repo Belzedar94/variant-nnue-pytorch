@@ -17,7 +17,7 @@ from atomic_v3.executor import (
     RUN_CONFIGS,
     production_config,
 )
-from atomic_v3.production import execute_runs
+from atomic_v3.production import ProductionPreflightRejected, execute_runs
 
 
 def _positive_microbatch(value: str) -> int:
@@ -91,14 +91,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_microbatch,
         default=MICROBATCH_SIZE,
         help=(
-            "physical provider batch; frozen to 128 and accumulated to "
-            f"{EFFECTIVE_BATCH_SIZE}"
+            "physical provider batch; frozen to the proven CUDA batch "
+            f"{EFFECTIVE_BATCH_SIZE} (no gradient accumulation)"
         ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="authenticate the receipt and print bindings without model/provider creation",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "run the mandatory same-process 5-warmup + 10-measured production "
+            "gate, emit its JSON report, and start zero epochs/checkpoints"
+        ),
     )
     return parser
 
@@ -196,7 +204,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shared_initial_state=arguments.shared_initial_state,
             device=arguments.device,
             resume=arguments.resume,
+            preflight_only=arguments.preflight_only,
         )
+    except ProductionPreflightRejected as error:
+        _print_json(error.document, stream=sys.stderr)
+        return 2
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
@@ -210,7 +222,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 1
     _print_json(summary)
-    return 0
+    return 2 if summary.get("status") == "rejected" else 0
 
 
 if __name__ == "__main__":

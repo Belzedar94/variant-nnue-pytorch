@@ -49,13 +49,20 @@ class StackedLinear(nn.Module):
         return self.linear.weight, self.linear.bias
 
     def forward(
-        self, value: torch.Tensor, bucket_indices: torch.Tensor, fake_quantize_weights: bool
+        self,
+        value: torch.Tensor,
+        bucket_indices: torch.Tensor,
+        fake_quantize_weights: bool,
+        *,
+        validate_bucket_range: bool = True,
     ) -> torch.Tensor:
         if value.ndim != 2 or bucket_indices.shape != (value.shape[0],):
             raise ValueError("stacked linear requires [batch, inputs] and [batch] buckets")
         if bucket_indices.dtype != torch.long:
             raise TypeError("layer-stack indices must use torch.long")
-        if torch.any((bucket_indices < 0) | (bucket_indices >= self.count)):
+        if validate_bucket_range and torch.any(
+            (bucket_indices < 0) | (bucket_indices >= self.count)
+        ):
             raise ValueError("layer-stack index outside [0, 7]")
         weight, bias = self._merged_parameters()
         if fake_quantize_weights:
@@ -116,13 +123,25 @@ class AtomicV3LayerStacks(nn.Module):
         bucket_indices: torch.Tensor,
         fake_quantize_activations: bool = True,
         fake_quantize_weights: bool = True,
+        validate_bucket_range: bool = True,
     ) -> torch.Tensor:
         if value.ndim != 2 or value.shape[1] != 1024:
             raise ValueError("SFNNv15 layer stacks require [batch, 1024] input")
         if bucket_indices.shape != (value.shape[0],):
             raise ValueError("layer-stack indices must have shape [batch]")
+        if bucket_indices.dtype != torch.long:
+            raise TypeError("layer-stack indices must use torch.long")
+        if validate_bucket_range and torch.any(
+            (bucket_indices < 0) | (bucket_indices >= LAYER_STACKS)
+        ):
+            raise ValueError("layer-stack index outside [0, 7]")
 
-        fc0 = self.fc0(value, bucket_indices, fake_quantize_weights)
+        fc0 = self.fc0(
+            value,
+            bucket_indices,
+            fake_quantize_weights,
+            validate_bucket_range=False,
+        )
         short_skip = fc0[:, -2:-1] - fc0[:, -1:]
         fc0_squared = fc0.square()
         fc0_linear = fc0
@@ -131,7 +150,12 @@ class AtomicV3LayerStacks(nn.Module):
             fc0_linear = fake_quantize_activation(fc0_linear)
         activated0 = clip_hidden_activation(torch.cat((fc0_squared, fc0_linear), dim=1))
 
-        fc1 = self.fc1(activated0, bucket_indices, fake_quantize_weights)
+        fc1 = self.fc1(
+            activated0,
+            bucket_indices,
+            fake_quantize_weights,
+            validate_bucket_range=False,
+        )
         fc1_squared = fc1.square()
         fc1_linear = fc1
         if fake_quantize_activations:
@@ -143,6 +167,7 @@ class AtomicV3LayerStacks(nn.Module):
             torch.cat((activated0, activated1), dim=1),
             bucket_indices,
             fake_quantize_weights,
+            validate_bucket_range=False,
         ) + short_skip
         if fake_quantize_activations:
             output = fake_quantize_output(output)

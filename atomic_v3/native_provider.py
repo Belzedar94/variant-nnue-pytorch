@@ -452,7 +452,7 @@ class NativeAtomicV3Provider:
         manifest_sha256: Sequence[str],
         manifest_records: Sequence[int],
         manifest_payloads: Sequence[bytes],
-        batch_size: int = 128,
+        batch_size: int = 16_384,
         random_fen_skipping: int = DEFAULT_RANDOM_FEN_SKIPPING,
         seed: int = DEFAULT_SEED,
         native_workers: int = 1,
@@ -581,7 +581,7 @@ class NativeAtomicV3Provider:
     def next_batch(self, maximum_samples: int):
         """Return one executor-owned batch without committing its cursor.
 
-        The native stream is configured for a fixed physical microbatch.  A
+        The native stream is configured for a fixed physical CUDA batch.  A
         production request that differs from it cannot be honored without
         creating a second cursor interpretation, so it fails before fetching.
         Validation may return a smaller final batch only at native EOF; the
